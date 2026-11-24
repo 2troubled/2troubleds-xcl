@@ -1184,7 +1184,8 @@ mod tests {
                         dxgi: (b & 0x3ff) >> 3,
                         // tile mode bits: 0 = 64 KB tiles (SW_64KB_D), else 4 KB (SW_4KB_S)
                         mode: if (b >> 24) & 3 == 0 { 10 } else { 5 },
-                        mips: (a >> 28).max(1),
+                        // the levels stored: dword 0 bits 28-31 plus dword 1 bits 0-2
+                        mips: ((a >> 28) + (b & 7)).max(1),
                         slices: ((b >> 10) & 0x7ff) + 1,
                         dim: (b >> 21) & 7,
                         start: (c & 0x1f_ffff) as usize * 4096 + 0x800,
