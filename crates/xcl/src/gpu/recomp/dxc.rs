@@ -508,8 +508,10 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
             match compile_linked(&program, &library, entry, profile, extra) {
                 Ok(dxil) => return Ok(dxil),
                 Err(e) => {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole: {e}"));
+                    // the same DXC fails the same way for the next program: stop trying
+                    if LINK_GATE.close() {
+                        crate::xlog_warn!("DXC: a program could not be linked with its memory accessors, compiled whole, and no more programs are linked: {e}");
+                    }
                 }
             }
         }
@@ -520,11 +522,47 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
 /// Accesses a program needs to be linked with its accessors: with 100 both ways take DXC 0.3 s.
 const LINK_MIN_ACCESSES: usize = 100;
 
+/// Whether programs are still linked with their accessors: off for the whole process after the
+/// first program that could not be linked (a DXC before 1.8 refuses `[WaveSize]` on a library
+/// entry, and would otherwise pay a failed attempt for every program).
+struct LinkGate(std::sync::atomic::AtomicBool);
+
+impl LinkGate {
+    const fn new() -> LinkGate {
+        LinkGate(std::sync::atomic::AtomicBool::new(true))
+    }
+
+    fn open(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Close the gate; true for the call that closed it.
+    fn close(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
+}
+
+static LINK_GATE: LinkGate = LinkGate::new();
+
 /// `XCL_LINK_MEM=0`: every program is compiled whole (into the same cache: compare with
 /// another `XCL_DXIL_CACHE`).
 fn linking() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_LINK_MEM").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("XCL_LINK_MEM").map_or(true, |v| v != "0")) && LINK_GATE.open()
+}
+
+/// A value kept per key, made once: the first caller of a key makes it with `make`, outside the
+/// map's lock (other keys go on meanwhile), and callers of the same key wait for that and get
+/// its result. A failure is not kept: the next caller tries again.
+fn kept_once<T: Clone>(map: &Mutex<Option<HashMap<String, Arc<Mutex<Option<T>>>>>>, key: &str, make: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let cell = map.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(key.to_string()).or_default().clone();
+    let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = &*slot {
+        return Ok(v.clone());
+    }
+    let v = make()?;
+    *slot = Some(v.clone());
+    Ok(v)
 }
 
 /// Compile `program` and `library` (its memory accessors, kept once compiled) as libraries and
@@ -533,17 +571,9 @@ fn compile_linked(program: &str, library: &str, entry: &str, profile: &str, extr
     let model = profile.split_once('_').map_or("6_6", |(_, m)| m);
     let lib = format!("lib_{model}");
     let accessors = {
-        static KEPT: Mutex<Option<HashMap<String, Arc<Vec<u8>>>>> = Mutex::new(None);
+        static KEPT: Mutex<Option<HashMap<String, Arc<Mutex<Option<Arc<Vec<u8>>>>>>>> = Mutex::new(None);
         let key = format!("{lib} {extra:?}\n{library}");
-        let kept = KEPT.lock().unwrap().get_or_insert_with(HashMap::new).get(&key).cloned();
-        match kept {
-            Some(a) => a,
-            None => {
-                let a = Arc::new(compile_whole(library, "", &lib, extra)?);
-                KEPT.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, a.clone());
-                a
-            }
-        }
+        kept_once(&KEPT, &key, || compile_whole(library, "", &lib, extra).map(Arc::new))?
     };
     let program = compile_whole(program, "", &lib, extra)?;
     let instance = |clsid: &GUID, iid: &GUID| -> Result<*mut c_void, String> {
@@ -1514,5 +1544,79 @@ pub(super) fn disassemble(dxil: &[u8]) -> Result<String, String> {
     unsafe {
         let r: IDxcResult = c.Disassemble(&buf).map_err(|e| format!("Disassemble: {e}"))?;
         output(r.GetStatus(), r.GetErrorBuffer(), r.GetResult()).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod accessor_library_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    type Kept = Mutex<Option<HashMap<String, Arc<Mutex<Option<u32>>>>>>;
+
+    /// Two programs that share one accessor library, starting together, compile it once.
+    #[test]
+    fn threads_asking_for_one_key_make_its_value_once() {
+        let map: Kept = Mutex::new(None);
+        let made = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let v = kept_once(&map, "library", || {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        // long enough for the other threads to ask before it is made
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(7)
+                    });
+                    assert_eq!(v, Ok(7));
+                });
+            }
+        });
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+
+    /// A value being made does not hold up the other keys.
+    #[test]
+    fn another_key_does_not_wait_for_a_value_being_made() {
+        let map: Kept = Mutex::new(None);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let map = &map;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let v = kept_once(map, "a", || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(1)
+                });
+                assert_eq!(v, Ok(1));
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            s.spawn(move || done_tx.send(kept_once(map, "b", || Ok(2))).unwrap());
+            let b = done_rx.recv_timeout(Duration::from_secs(2));
+            release_tx.send(()).unwrap();
+            assert_eq!(b, Ok(Ok(2)), "key b waited for key a");
+        });
+    }
+
+    /// A failed make is tried again by the next caller; a made value is kept.
+    #[test]
+    fn a_failure_is_not_kept() {
+        let map: Kept = Mutex::new(None);
+        assert_eq!(kept_once(&map, "k", || Err("no".to_string())), Err("no".to_string()));
+        assert_eq!(kept_once(&map, "k", || Ok(3)), Ok(3));
+        assert_eq!(kept_once(&map, "k", || Err("not asked".to_string())), Ok(3));
+    }
+
+    /// The first failure to link closes the gate, once.
+    #[test]
+    fn the_link_gate_closes_at_the_first_failure() {
+        let gate = LinkGate::new();
+        assert!(gate.open());
+        assert!(gate.close());
+        assert!(!gate.open());
+        assert!(!gate.close());
     }
 }
