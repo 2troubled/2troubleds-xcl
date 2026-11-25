@@ -1947,7 +1947,7 @@ mod tests {
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
-        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;

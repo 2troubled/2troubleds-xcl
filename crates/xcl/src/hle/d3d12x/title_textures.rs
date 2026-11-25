@@ -1525,8 +1525,8 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
         use windows_sys::Win32::System::Memory as mem;
 
-        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if super::super::backend() != super::super::Backend::Real {
             crate::gpu::recomp::runner::skip_test("no GPU");
             return;
@@ -1766,7 +1766,7 @@ mod tests {
     /// submission order, each time it is; a Reset forgets them; other resources are not noted.
     #[test]
     fn transitions_apply_when_their_list_is_submitted() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // RGBA8 64×64, 3 mips, 2 slices (6 subresources), 4KB_S
         let mut d = [0u8; 0x38];
         d[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -1965,8 +1965,8 @@ mod tests {
     /// chains (including packed mips), cubemap arrays (`extra_pages`) and 3D volumes upload intact.
     #[test]
     fn placed_title_textures_share_vram_and_preserve_pixels() {
-        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
