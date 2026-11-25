@@ -38,7 +38,7 @@ const F_RING: usize = 0x2000;
 const F_RING_AT: usize = 0x2100;
 const RING: usize = 64;
 /// Maximum number of mid-list split segments per command list recording.
-const MAX_EXTRA_SEGMENTS: usize = 256;
+const MAX_EXTRA_SEGMENTS: usize = 1024;
 
 #[derive(Default)]
 struct SegmentBook {

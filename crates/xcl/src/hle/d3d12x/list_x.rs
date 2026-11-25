@@ -6893,11 +6893,15 @@ mod tests {
             let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
 
             let standin = 0x7E57_D001usize;
+            static BUILD: AtomicBool = AtomicBool::new(false);
             pso_async::submit(
                 standin,
                 true,
                 Box::new(|| {
-                    std::thread::sleep(Duration::from_millis(1500));
+                    let t = Instant::now();
+                    while !BUILD.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(10) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     0
                 }),
             );
@@ -6907,12 +6911,16 @@ mod tests {
             bind::reset(pc0, alloc.as_raw() as usize, standin);
             let wrap = title_list::wrap(pc0);
 
-            let t = Instant::now();
-            bind::dispatch(pc0, 1, 1, 1);
-            assert!(t.elapsed() < Duration::from_millis(700), "the dispatch waited for the build ({:?})", t.elapsed());
-            let mut segs = Vec::new();
-            assert!(title_list::push_segments(wrap, &mut segs));
-            assert_eq!(segs.len(), 3, "the list before the dispatch, the dispatch, the list after it");
+            const DISPATCHES: usize = 210;
+            let mut segs = vec![pc0];
+            for n in 1..=DISPATCHES {
+                let t = Instant::now();
+                bind::dispatch(*segs.last().unwrap(), 1, 1, 1);
+                assert!(t.elapsed() < Duration::from_millis(700), "dispatch {n} waited for the build ({:?})", t.elapsed());
+                segs.clear();
+                assert!(title_list::push_segments(wrap, &mut segs));
+            }
+            assert_eq!(segs.len(), 1 + 2 * DISPATCHES, "the list before each dispatch, the dispatch, the list after it");
             assert!(pso_async::is_pending(standin));
 
             let close_fn: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(*(*(wrap as *const *const usize)).add(9));
@@ -6920,9 +6928,14 @@ mod tests {
             assert!(pso_async::is_pending(standin), "Close waited for the build");
 
             let skipped = bind::counts_snapshot()[4];
+            let build = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                BUILD.store(true, Ordering::Release);
+            });
             record_deferred(wrap);
             assert!(!pso_async::is_pending(standin), "the submit waits for the build");
             assert!(bind::counts_snapshot()[4] > skipped, "the dispatch of a build that failed is skipped, at the submit");
+            build.join().unwrap();
 
             type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
             let exec: ExecFn = std::mem::transmute(*(*(queue.as_raw() as *const *const usize)).add(PC_QUEUE_EXECUTE_COMMAND_LISTS));
