@@ -281,13 +281,16 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   - `XCL_TRACE_FAULTS=1` (any value): the first 32 access violations are logged as they are raised
     (read, write or execute, the address, some registers and the callers on the stack), before the
     title's own handlers see them – for a title whose crash filter ends the process without a trace.
-  - `XCL_TRACE_MEM=1`: the title's memory allocations of 64 KiB or more are logged, the first 60
-    (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`).
+  - `XCL_TRACE_MEM=1` (any value turns it on): the title's memory allocations of 64 KiB or more
+    are logged, the first 60 (`XCL_TRACE_MEM=n` with `n > 1`: the first `n`). The same variable
+    also logs XCL's own allocations of 1 MB or more in the title's committed memory window, and
+    the ones that fail.
   - `XCL_TRACE_IMPORTS`: logs the arguments and the result of every call of the imports it names.
     A comma-separated list: `1` or `hle` for every function XCL implements (also what a list with
     no word to add means), `all` for the system's functions too (short runs only), any other word
-    is the start of a `dll!Function` name to add, and `-word` one to leave out, for example
-    `hle,-kernelx!GetTickCount,gameinput`.
+    is the start of a `dll!Function` name to add, and `-word` one to leave out; the name is the
+    DLL's file name with its extension and case does not matter, so for example
+    `hle,-kernelx.dll!GetTickCount,gameinput`.
   - `XCL_D3D12_TRACE=1` (any value): every call console code makes to a public D3D12.X method is
     logged with the interface and method name. Very verbose: use it for a short run.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
