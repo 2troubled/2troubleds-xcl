@@ -2704,6 +2704,7 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         }
         if let Some(last) = last {
             super::bind::pass_arena(last, seg);
+            real::dispatch_chain::list_follows(last as usize, seg as usize);
         }
         match what {
             Deferred::Dispatch(x, y, z) => super::bind::dispatch(seg, x, y, z),
@@ -2713,6 +2714,18 @@ pub(super) unsafe fn record_deferred(wrapper: *mut c_void) {
         pc::<unsafe extern "system" fn(*mut c_void) -> i32>(seg, PC_CLOSE)(seg);
         real::preserve_vtable(seg, ext);
         last = Some(seg);
+    }
+}
+
+/// The allocator `list`'s put-off calls recorded on is reset once the GPU is done with them, so
+/// their split dispatches' scratch does not outlive them.
+unsafe fn reset_own_alloc(list: *mut c_void) {
+    let own = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))?.own_alloc.clone());
+    let Some(own) = own else { return };
+    let own = own.as_raw();
+    // (without `alloc_pool` nothing says whether the GPU is done: the next submit resets it)
+    if super::alloc_pool::enabled() && !super::alloc_pool::allocator_in_flight(own as usize) {
+        super::alloc_pool::title_reset(own).unwrap_or_else(|| real::reset_pc_allocator(own));
     }
 }
 
@@ -4058,6 +4071,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     }
 
     reset_copy_scratch(this);
+    reset_own_alloc(this);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
