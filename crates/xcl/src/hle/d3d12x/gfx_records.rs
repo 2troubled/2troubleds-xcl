@@ -546,8 +546,11 @@ pub(crate) fn read_history_payloads(path: &Path) -> Result<Vec<Vec<u8>>, String>
     read_complete(path, true, |bytes, _| bytes.to_vec())
 }
 
-pub(crate) fn read_job(path: &Path) -> Result<Vec<Entry>, String> {
-    read_complete(path, false, |_, entry| entry)
+pub(crate) fn read_job(path: &Path) -> Result<Vec<(u64, Entry)>, String> {
+    read_complete(path, false, |bytes, entry| {
+        let recipe = if matches!(entry, Entry::Shader(_, _)) { 0 } else { crate::gpu::shader::fnv64(bytes) };
+        (recipe, entry)
+    })
 }
 
 /// What became of an entry handed to `Writer::add`.

@@ -4545,7 +4545,7 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
-    fn enabled() -> bool {
+    pub(crate) fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
     }
@@ -5344,10 +5344,16 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         } else { finish_pso(this, f, c as *const _ as *const c_void, riid, ppv) },
     );
     let hr = build.hr;
+    if build.reused {
+        if let Some(blob) = cached.as_ref() {
+            crate::shaders::warm_replay::accepted(disk.as_deref(), blob);
+        }
+    }
     if build.cache_eligible {
         keep_graphics_blob(gkey, *ppv, bytes);
         if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
             driver_cache::keep(p, &b, build.in_driver);
+            crate::shaders::warm_replay::accepted(Some(p), &b);
         }
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
@@ -6322,6 +6328,10 @@ fn two_pass_driver_id(device: *mut c_void) -> Option<u64> {
     })
 }
 
+pub(crate) fn preparation_driver_identity(dev: &ID3D12Device) -> Option<u64> {
+    two_pass_driver_id(dev.as_raw())
+}
+
 /// Create the mesh pipeline (RS and shaders already in the stream) and its compute pass.
 #[allow(clippy::too_many_arguments)]
 unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -6392,6 +6402,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     };
     if let Some(key) = gkey {
         if greused {
+            if let Some(blob) = gcached.as_ref() {
+                crate::shaders::warm_replay::accepted(gdisk.as_deref(), blob);
+            }
             if let Some(blob) = gcached.filter(|_| gfrom_disk) {
                 remember_graphics_blob(key, blob);
                 driver_cache::note(true, None);
@@ -6403,6 +6416,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
                 if let Some(blob) = blob {
                     if let Some(path) = gdisk.as_deref().filter(|_| slow) {
                         driver_cache::keep(path, &blob, gin_driver);
+                        crate::shaders::warm_replay::accepted(Some(path), &blob);
                     }
                     remember_graphics_blob(key, blob);
                 }
@@ -6447,10 +6461,16 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         cin_driver += took;
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    if creused {
+        if let Some(blob) = ccached.as_ref() {
+            crate::shaders::warm_replay::accepted(cdisk.as_deref(), blob);
+        }
+    }
     if hc >= 0 && !creused && !compute.is_null() {
         keep_compute_blob(ckey, compute, tp.cs.len());
         if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
             driver_cache::keep(p, &b, cin_driver);
+            crate::shaders::warm_replay::accepted(Some(p), &b);
         }
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);

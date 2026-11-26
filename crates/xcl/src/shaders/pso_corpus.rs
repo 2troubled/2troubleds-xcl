@@ -91,6 +91,7 @@ impl Corpus {
         }
         if self.compute.is_empty() { return progress.check_corpus_complete(); }
         let mut pipelines = Pipelines::for_adapter(&progress.adapter)?;
+        pipelines.warm_blobs = super::warm_blobs::Verified::for_device(&pipelines.dev);
         pipelines.max_dxil = 0;
         pipelines.most = parallel;
         let next = AtomicUsize::new(0);
@@ -118,6 +119,10 @@ impl Corpus {
                 });
             }
         });
+        if let Some(book) = &pipelines.warm_blobs {
+            book.save();
+            eprintln!("previously verified native compute pipelines: {}", pipelines.verified.load(Ordering::Relaxed));
+        }
         if let Some(e) = error.into_inner().unwrap() { return Err(e); }
         progress.check_corpus_complete()
     }

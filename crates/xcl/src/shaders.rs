@@ -14,6 +14,24 @@ use std::sync::Mutex;
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 use crate::hle::d3d12x::gfx_records;
 pub(crate) mod pso_corpus;
+mod warm_blobs;
+mod warm_pack;
+pub(crate) mod warm_replay;
+
+pub(crate) fn warm_settings_key() -> u64 {
+    let mut settings: Vec<_> = std::env::vars_os().filter(|(k,_)| {
+        let k = k.to_string_lossy();
+        k.starts_with("XCL_") && !matches!(k.as_ref(), "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
+            "XCL_PRECOMPILE_SLICE" | "XCL_PRECOMPILE_COVERAGE_MAP" | "XCL_PRECOMPILE_COVERAGE_DIR" |
+            "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PREPARE" | "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" |
+            "XCL_PRESS_AT" | "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" |
+            "XCL_FRAME_DUMP" | "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS")
+    }).collect();
+    settings.sort();
+    warm_blobs::digest(&settings)
+}
+
+
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -1284,6 +1302,8 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<(bool, Vec<u32>), windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    warm_blobs: Option<warm_blobs::Verified>,
+    verified: AtomicUsize,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
@@ -1538,6 +1558,8 @@ impl Pipelines {
             Ok(Pipelines {
                 dev,
                 signatures: Mutex::new(Default::default()),
+                warm_blobs: None,
+                verified: AtomicUsize::new(0),
                 made: AtomicUsize::new(0),
                 refused: AtomicUsize::new(0),
                 reused: AtomicUsize::new(0),
@@ -1617,6 +1639,7 @@ impl Pipelines {
                      path_override: Option<PathBuf>, required: bool) -> Result<(), String> {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
+        let layout = self.warm_blobs.as_ref().map(|_| warm_blobs::digest(&key));
         let rs = {
             let mut g = self.signatures.lock().unwrap();
             match g.get(&key) {
@@ -1654,6 +1677,14 @@ impl Pipelines {
             driver_cache::path_for(dxil, desc.Flags.0, chained)
         });
         let mut cached = path.as_deref().and_then(driver_cache::load);
+        let receipt = self.warm_blobs.as_ref().zip(layout).zip(path.as_deref());
+        if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
+            if book.contains(&warm_blobs::stamp(path, layout, blob)) {
+                self.verified.fetch_add(1, Ordering::Relaxed);
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                return Ok(());
+            }
+        }
         let over_cap = self.max_dxil != 0 && dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
@@ -1715,6 +1746,9 @@ impl Pipelines {
             return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
         }
         let r = if let Some(pso) = from_cache {
+            if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
+                book.record(warm_blobs::stamp(path, layout, blob));
+            }
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
         } else {
@@ -1725,7 +1759,10 @@ impl Pipelines {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                     let len = unsafe { blob.GetBufferSize() };
                     if !bytes.is_null() && len != 0 {
-                        driver_cache::write(path, unsafe { std::slice::from_raw_parts(bytes, len) });
+                        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+                        if driver_cache::write(path, bytes) {
+                            if let Some(((book, layout), _)) = receipt { book.record(warm_blobs::stamp(path, layout, bytes)); }
+                        }
                     }
                 }
             }
@@ -1933,6 +1970,7 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Optio
         precompile(input, usize::MAX, windows, None, None, true, None, None, std::time::Instant::now(), Some(progress), coverage.as_ref())?;
     }
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+    if std::env::var("XCL_PREPARE_GRAPHICS").is_ok_and(|v| v.trim() == "0") { return Ok(()); }
     graphics_in_workers(&inputs, windows, workers, progress, corpus.and_then(|c| c.graphics_path()))
 }
 
@@ -2401,7 +2439,8 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
         Ok(entries) => entries,
         Err(e) => { eprintln!("xcl shaders: {}: {e}", job.display()); return 2; }
     };
-    for entry in entries {
+    let mut recipe_keys = Vec::new();
+    for (key, entry) in entries {
         match entry {
             gfx_records::Entry::Shader(key, code) => {
                 if real::shader_key(&code) != key || shaders.get(&key).is_some_and(|prior| prior != &code) {
@@ -2410,7 +2449,7 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
                 }
                 shaders.insert(key, code);
             }
-            entry => records.extend(GraphicsHistoryRecord::from_entry(entry)),
+            entry => if let Some(record) = GraphicsHistoryRecord::from_entry(entry) { records.push(record); recipe_keys.push(key); },
         }
     }
     let n = records.len();
@@ -2424,11 +2463,19 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
     crate::gpu::uma::leave_out();
     recomp::pso::set_title_windows(windows);
     recomp::dxc::set_memory_reserve(2);
-    let device = match Pipelines::for_adapter("auto") {
-        Ok(p) => real::prepare_device(p.dev),
+    let (device, book) = match Pipelines::for_adapter("auto") {
+        Ok(p) => {
+            let cache = recomp::dxc::cache_dir();
+            let book = warm_replay::native_key(&p.dev).and_then(|key| {
+                let known = warm_replay::driver_files(&cache.join("driver")).unwrap_or_default();
+                warm_replay::Index::open(&cache, &known, warm_blobs::digest(&(key, &recipe_keys)), windows)
+            });
+            (real::prepare_device(p.dev), book)
+        },
         Err(e) => { eprintln!("xcl shaders: no pipeline device: {e}"); return 2; }
     };
     let threads = corpus_threads(requested, 1).min(ready.len());
+    let verified = AtomicUsize::new(0);
     let (next, made, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(missing));
     let t0 = std::time::Instant::now();
     std::thread::scope(|s| {
@@ -2439,7 +2486,8 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
                 let r = &records[index];
                 let code = |key| shaders.get(&key).map(Vec::as_slice);
                 // (a pipeline that panics fails; the others are built)
-                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r {
+                let key = recipe_keys[index];
+                let run = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r {
                     GraphicsHistoryRecord::Legacy(record) => {
                         let desc = record.desc(record.shaders.map(code));
                         unsafe { real::prepare_graphics(device, &desc, record.depth_bounds) }
@@ -2448,6 +2496,16 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
                         unsafe { real::replay_mesh_record(device, record, record.shaders.map(code)).is_ok() }
                     }
                 })).unwrap_or(false);
+                let ok = if let Some(book) = &book {
+                    if book.can_defer(key) {
+                        verified.fetch_add(1, Ordering::Relaxed);
+                        true
+                    } else {
+                        let (ok, files) = warm_replay::capture(run);
+                        if ok { book.add(key, files, matches!(r, GraphicsHistoryRecord::Mesh(_))); }
+                        ok
+                    }
+                } else { run() };
                 if ok {
                     let d = made.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
@@ -2458,6 +2516,8 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
             });
         }
     });
+    if let Some(book) = book { book.save(); }
+    eprintln!("previously verified native graphics recipes: {}", verified.into_inner());
     let (hits, _, stored) = real::driver_cache_stats();
     let failed = failed.into_inner();
     eprintln!("graphics pipelines: {} made, {failed} failed; driver blobs: {hits} from disk, {stored} kept", made.into_inner());
@@ -2498,6 +2558,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         if let Some(threads) = pipeline_threads {
             p.most = threads.max(1);
         }
+        if mandatory { p.warm_blobs = warm_blobs::Verified::for_device(&p.dev); }
         if mandatory && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
             p.max_dxil = 0;
         }
@@ -2535,6 +2596,21 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let startup_device = pipelines.filter(|_| startup.is_some());
     let graphics_split = split.unwrap_or_else(|| startup_device.map_or_else(recomp::runner::graphics_wave32, |p| recomp::pso::graphics_wave32_for_device(&p.dev)));
     let split = split.unwrap_or_else(|| startup_device.map_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w), |p| recomp::pso::wave32_only_for_device(&p.dev)));
+    // A graphics-stage proof skips translation only. Compute records still pass through
+    // coverage and native preparation, including a changed or newly staged compute job.
+    let pack_proof = startup.and_then(|owner| {
+        let Input::Pack { data, .. } = input else { return None };
+        if n != input.len() || only.is_some() || selected.is_some() || slice.is_some() { return None; }
+        let extra_device;
+        let device = match pipelines {
+            Some(p) => &p.dev,
+            None => {
+                extra_device = Pipelines::for_adapter(&owner.adapter).ok()?;
+                &extra_device.dev
+            }
+        };
+        warm_pack::Stages::open(warm_replay::native_key(device)?, data, n, windows, split, graphics_split)
+    });
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {} memory windows{}{})",
         recomp::dxc::cache_dir().display(),
@@ -2559,6 +2635,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     if let Some(p) = startup { p.done.fetch_add(1, Ordering::Relaxed); }
                     if d % every == 0 { eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64()); }
                 };
+                if pack_proof.as_ref().is_some_and(|p| p.covered(i)) {
+                    record_done();
+                    continue;
+                }
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else {
                     if startup.is_some() { failed.fetch_add(1, Ordering::Relaxed); }
@@ -2629,6 +2709,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
+                let mut stage_outputs = Vec::new();
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -2663,9 +2744,14 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                             }
                         };
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
-                                Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
-                                Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                            let src = src.as_deref().unwrap_or(&t.hlsl);
+                            match recomp::dxc::compile_cached(src, "main", profile) {
+                                Ok((bytes, hit)) => {
+                                    if pack_proof.is_some() {
+                                        stage_outputs.push((recomp::dxc::cache_key(src, "main", profile), bytes.len() as u64));
+                                    }
+                                    if hit { &cached } else { &compiled }.fetch_add(1, Ordering::Relaxed)
+                                }
                                 Err(e) => {
                                     let mut g = errors.lock().unwrap();
                                     if g.len() < 10 {
@@ -2677,6 +2763,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                         }
                     }
                 }
+                if let Some(proof) = &pack_proof { proof.record(i, stage_outputs); }
                 record_done();
             });
         }
@@ -2709,6 +2796,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             make_pipelines(p, pipeline_jobs.into_inner().unwrap());
         }
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        if let Some(book) = &p.warm_blobs {
+            book.save();
+            println!("previously verified native compute pipelines {}", p.verified.load(Ordering::Relaxed));
+        }
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
         println!("pipelines left to another process that was building them {}", p.elsewhere.load(Ordering::Relaxed));
         let split_programs = p.split_programs.load(Ordering::Relaxed);
@@ -2734,6 +2825,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
             return Err(format!("Shader preparation stopped: {failed} record failures, {refused} refused pipelines, {capped} over the size cap. {cause}"));
         }
     }
+    if let Some(proof) = pack_proof { proof.save(); }
     Ok(())
 }
 
