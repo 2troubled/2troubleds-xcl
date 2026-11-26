@@ -2047,6 +2047,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let unused = AtomicUsize::new(0);
     let matched: Mutex<std::collections::HashSet<u64>> = Mutex::new(Default::default());
     let pipeline_jobs: Mutex<Vec<PipelineJob>> = Mutex::new(Vec::new());
     let used_earlier = if pipelines.is_some() && startup.is_none() {
