@@ -12,6 +12,7 @@
 //! payload  = 1 key u64 shaders [u64; 5] state input*      a pipeline
 //!          | 2 key u64 bytes                              a shader (preparation job files only)
 //!          | 3 key u64 shaders [u64; 2] layout state     a mesh pipeline stream
+//!          | 4 key u64 shaders [u64; 5] state input*     a pipeline with depth bounds enabled
 //! key      = `real::shaders_key` of the set, in mesh then PS order for mesh; in a shader entry,
 //!            `real::shader_key` of it
 //! shaders  = `real::shader_key` of VS, PS, DS, HS, GS, or mesh, PS (0: none)
@@ -42,10 +43,16 @@ const HEADER: usize = 12;
 const PIPELINE: u8 = 1;
 const SHADER: u8 = 2;
 const MESH_PIPELINE: u8 = 3;
-const MAX_MESH_LAYOUT: usize = 14; // root, mesh (MS or AS), PS, and eleven scalar state types
+const DEPTH_BOUNDS_PIPELINE: u8 = 4;
+const MAX_MESH_LAYOUT: usize = 19; // includes four inactive shader slots and an empty input layout
 
-/// The records of this cache (beside the DXIL cache, as `used-pipelines.txt`).
+/// New records belong to the active title. A shared translation cache can serve unrelated titles.
 pub(crate) fn path() -> PathBuf {
+    if let Some(boot) = crate::state::boot() { return boot.cache_dir().join("used-graphics-pipelines.bin"); }
+    shared_history_path()
+}
+
+pub(crate) fn shared_history_path() -> PathBuf {
     crate::gpu::recomp::dxc::cache_dir().join("used-graphics-pipelines.bin")
 }
 
@@ -223,10 +230,16 @@ fn valid_mesh_layout(shaders: [u64; 2], layout: &[u32]) -> bool {
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL
+            | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY
             | D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS
@@ -244,14 +257,17 @@ fn valid_mesh_layout(shaders: [u64; 2], layout: &[u32]) -> bool {
     }
     let has = |kind: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| seen & (1 << kind.0) != 0;
     (has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) != has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS))
-        && has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) == (shaders[1] != 0)
+        && (shaders[1] == 0 || has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS))
+        && !(has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL) && has(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1))
 }
 
 /// A mesh stream entry with shader keys in mesh, PS order and subobjects in their original order.
-pub(crate) fn encode_mesh(key: u64, shaders: [u64; 2], layout: &[u32], d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<Vec<u8>> {
+pub(crate) fn encode_mesh(key: u64, shaders: [u64; 2], layout: &[u32], d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, depth_bounds: bool) -> Option<Vec<u8>> {
     if key == 0 || !valid_mesh_layout(shaders, layout) || d.NumRenderTargets > 8 {
         return None;
     }
+    let depth1 = layout.contains(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1.0 as u32));
+    if depth_bounds && !depth1 { return None; }
     let mut values = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         BlendState: d.BlendState,
         SampleMask: d.SampleMask,
@@ -276,6 +292,7 @@ pub(crate) fn encode_mesh(key: u64, shaders: [u64; 2], layout: &[u32], d: &D3D12
     out.push(layout.len() as u8);
     out.extend(layout.iter().map(|&id| id as u8));
     state(&mut values, &mut |v, _| put_var(&mut out, (*v).into()));
+    if depth1 { put_var(&mut out, u64::from(depth_bounds)); }
     Some(out)
 }
 
@@ -291,6 +308,7 @@ pub(crate) fn shader_entry(key: u64, bytes: &[u8]) -> Vec<u8> {
 /// A pipeline as a title described it, but its shaders and root signature (`desc` puts them in).
 pub(crate) struct Record {
     pub key: u64,
+    pub depth_bounds: bool,
     /// `real::shader_key` of the VS, PS, DS, HS, GS (0: none)
     pub shaders: [u64; 5],
     desc: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>,
@@ -322,7 +340,16 @@ pub(crate) struct MeshRecord {
     pub key: u64,
     pub shaders: [u64; 2],
     pub layout: Vec<u32>,
+    pub depth_bounds: bool,
     desc: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>,
+}
+
+pub(crate) fn depth_stencil1(d: &D3D12_DEPTH_STENCIL_DESC, bounds: bool) -> D3D12_DEPTH_STENCIL_DESC1 {
+    D3D12_DEPTH_STENCIL_DESC1 {
+        DepthEnable: d.DepthEnable, DepthWriteMask: d.DepthWriteMask, DepthFunc: d.DepthFunc,
+        StencilEnable: d.StencilEnable, StencilReadMask: d.StencilReadMask, StencilWriteMask: d.StencilWriteMask,
+        FrontFace: d.FrontFace, BackFace: d.BackFace, DepthBoundsTestEnable: bounds.into(),
+    }
 }
 
 // The decoder starts with null pointers and only fills scalar fields. The descriptor is immutable.
@@ -357,7 +384,8 @@ fn decode_mesh(key: u64, mut r: Reader<'_>) -> Option<MeshRecord> {
         Some(x) => *v = x,
         None => valid = false,
     });
-    (valid && r.0.is_empty()).then_some(MeshRecord { key, shaders, layout, desc })
+    let depth_bounds = layout.contains(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1.0 as u32)) && r.bounded_var(1)? != 0;
+    (valid && r.0.is_empty()).then_some(MeshRecord { key, shaders, layout, desc, depth_bounds })
 }
 
 /// The entry of `payload` (None: not one this version writes).
@@ -371,7 +399,7 @@ pub(crate) fn decode(payload: &[u8]) -> Option<Entry> {
     if tag == MESH_PIPELINE {
         return decode_mesh(key, r).map(Entry::MeshPipeline);
     }
-    if tag != PIPELINE {
+    if !matches!(tag, PIPELINE | DEPTH_BOUNDS_PIPELINE) {
         return None;
     }
     let mut shaders = [0u64; 5];
@@ -415,7 +443,7 @@ pub(crate) fn decode(payload: &[u8]) -> Option<Entry> {
             InstanceDataStepRate: f[5],
         })
         .collect();
-    Some(Entry::Pipeline(Record { key, shaders, desc, inputs, _names: names }))
+    Some(Entry::Pipeline(Record { key, shaders, depth_bounds: tag == DEPTH_BOUNDS_PIPELINE, desc, inputs, _names: names }))
 }
 
 fn header() -> [u8; HEADER] {
@@ -452,6 +480,23 @@ fn payloads(file: &[u8]) -> Option<(Vec<&[u8]>, usize)> {
 pub(crate) fn read(path: &Path) -> Vec<Vec<u8>> {
     let file = std::fs::read(path).unwrap_or_default();
     payloads(&file).map_or_else(Vec::new, |(list, _)| list.into_iter().map(<[u8]>::to_vec).collect())
+}
+
+/// A completed worker job must contain only whole, supported records. A history file
+/// may be open for appends, so its reader above accepts a trailing partial entry.
+fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Result<Vec<T>, String> {
+    let file = std::fs::read(path).map_err(|e| e.to_string())?;
+    let (payloads, end) = payloads(&file).ok_or("unrecognized graphics job header")?;
+    if end != file.len() { return Err(format!("damaged graphics job at byte {end}")); }
+    payloads.into_iter().enumerate().map(|(i, p)| decode(p).map(|entry| take(p, entry)).ok_or_else(|| format!("invalid graphics job entry {}", i + 1))).collect()
+}
+
+pub(crate) fn read_complete_payloads(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    read_complete(path, |bytes, _| bytes.to_vec())
+}
+
+pub(crate) fn read_job(path: &Path) -> Result<Vec<Entry>, String> {
+    read_complete(path, |_, entry| entry)
 }
 
 /// What became of an entry handed to `Writer::add`.
@@ -655,6 +700,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn classic_depth_bounds_record_keeps_version_one_state() {
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        let mut bytes = unsafe { encode(7, [9, 0, 0, 0, 0], &desc) };
+        assert!(!pipeline(&bytes).depth_bounds);
+        bytes[0] = DEPTH_BOUNDS_PIPELINE;
+        let record = pipeline(&bytes);
+        assert!(record.depth_bounds);
+        assert_eq!(record.shaders, [9, 0, 0, 0, 0]);
+        assert_eq!(record.key, 7);
+        bytes.pop();
+        assert!(decode(&bytes).is_none());
+    }
+
     /// A description comes back with every field (as the key of its translated pipeline's driver
     /// blob sees them), its input layout and its shaders' keys.
     #[test]
@@ -712,14 +771,14 @@ mod tests {
         let mut desc = described();
         let ps = b"pixel";
         desc.PS = D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() };
-        let payload = encode_mesh(0x1234, shaders, &layout, &desc).unwrap();
+        let payload = encode_mesh(0x1234, shaders, &layout, &desc, false).unwrap();
         let Some(Entry::MeshPipeline(record)) = decode(&payload) else { panic!("expected a mesh entry") };
         assert_eq!((record.key, record.shaders), (0x1234, shaders));
         assert_eq!(record.layout, layout);
         assert_eq!(record.state().RasterizerState.DepthBias, desc.RasterizerState.DepthBias);
         assert_eq!(record.state().RTVFormats, desc.RTVFormats);
         assert!(record.state().PS.pShaderBytecode.is_null());
-        assert_eq!(encode_mesh(record.key, record.shaders, &record.layout, record.state()).unwrap(), payload);
+        assert_eq!(encode_mesh(record.key, record.shaders, &record.layout, record.state(), record.depth_bounds).unwrap(), payload);
     }
 
     #[test]
@@ -729,12 +788,13 @@ mod tests {
         let ps = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32;
         let input = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32;
         let d = described();
-        for layout in [vec![], vec![ms, moved], vec![ms, ms], vec![ms, ps], vec![ms, input]] {
-            assert!(encode_mesh(1, [1, 0], &layout, &d).is_none(), "unsupported layout {layout:?}");
+        let stream_output = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT.0 as u32;
+        for layout in [vec![], vec![ms, moved], vec![ms, ms], vec![ms, ps, ps], vec![ms, stream_output], vec![ms, 11, 21]] {
+            assert!(encode_mesh(1, [1, 0], &layout, &d, false).is_none(), "unsupported layout {layout:?}");
         }
-        assert!(encode_mesh(1, [1, 2], &[ms], &d).is_none());
-        assert!(encode_mesh(1, [0, 0], &[ms], &d).is_none());
-        let payload = encode_mesh(1, [1, 0], &[ms], &d).unwrap();
+        assert!(encode_mesh(1, [1, 2], &[ms], &d, false).is_none());
+        assert!(encode_mesh(1, [0, 0], &[ms], &d, false).is_none());
+        let payload = encode_mesh(1, [1, 0], &[ms], &d, false).unwrap();
         assert!(decode(&payload[..payload.len() - 1]).is_none());
         assert!(decode(&[payload.as_slice(), &[0]].concat()).is_none());
 
@@ -751,12 +811,51 @@ mod tests {
     }
 
     #[test]
+    fn mesh_bounds_and_empty_subobjects_survive_the_worker_job() {
+        let layout = [0, 25, 2, 3, 4, 5, 8, 9, 10, 21, 17, 12, 14, 15, 16];
+        let desc = described();
+        for bounds in [false, true] {
+            let job = encode_mesh(1, [1, 0], &layout, &desc, bounds).unwrap();
+            let Some(Entry::MeshPipeline(record)) = decode(&job) else { panic!("mesh record missing") };
+            assert_eq!(record.layout, layout);
+            assert_eq!(record.depth_bounds, bounds);
+            assert_eq!(record.shaders, [1, 0]);
+            let state = depth_stencil1(&record.state().DepthStencilState, record.depth_bounds);
+            assert_eq!(state.BackFace, desc.DepthStencilState.BackFace);
+            assert_eq!(state.DepthBoundsTestEnable.as_bool(), bounds);
+            assert!(decode(&job[..job.len() - 1]).is_none());
+            let mut bad = job; *bad.last_mut().unwrap() = 2;
+            assert!(decode(&bad).is_none());
+        }
+        assert!(encode_mesh(1, [1, 0], &[25, 11], &desc, true).is_none());
+    }
+
+    #[test]
+    fn complete_jobs_reject_damaged_or_unknown_entries() {
+        let dir = directory("complete-job");
+        let path = dir.0.join("job.bin");
+        assert!(read_job(&path).is_err());
+        {
+            let mut writer = Writer::open(&path, u64::MAX).unwrap();
+            writer.add(&shader_entry(5, b"shader")).unwrap();
+        }
+        assert_eq!(read_job(&path).unwrap().len(), 1);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [&original[..], &[1, 2]].concat()).unwrap();
+        assert!(read_job(&path).is_err());
+        assert_eq!(read(&path).len(), 1);
+        std::fs::write(&path, original).unwrap();
+        Writer::open(&path, u64::MAX).unwrap().add(&[0xff]).unwrap();
+        assert!(read_job(&path).is_err());
+    }
+
+    #[test]
     fn legacy_pipeline_and_mesh_entries_share_version_one_history() {
         let dir = directory("mesh-version-one");
         let path = dir.0.join("records.bin");
         let legacy = unsafe { encode(3, [3, 0, 0, 0, 0], &described()) };
         let shader = shader_entry(5, b"mesh");
-        let mesh = encode_mesh(5, [5, 0], &[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32], &described()).unwrap();
+        let mesh = encode_mesh(5, [5, 0], &[D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32], &described(), false).unwrap();
         let mut writer = Writer::open(&path, 1 << 20).unwrap();
         writer.add(&legacy).unwrap();
         writer.add(&mesh).unwrap();

@@ -5015,6 +5015,23 @@ mod graphics_blob_tests {
     use super::*;
 
     #[test]
+    fn classic_depth_bounds_record_preserves_native_state_and_cache_identity() {
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+        d.DepthStencilState.StencilReadMask = 0x5a;
+        let stream = depth_bounds_stream(&d);
+        let fields = stream_subobjects(&stream.0).unwrap();
+        let (_, bytes) = fields.iter().find(|(ty, _)| *ty == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1.0 as u32).unwrap();
+        let state = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<D3D12_DEPTH_STENCIL_DESC1>()) };
+        assert!(state.DepthBoundsTestEnable.as_bool());
+        assert_eq!(state.DepthFunc, d.DepthStencilState.DepthFunc);
+        assert_eq!(state.StencilReadMask, 0x5a);
+        let key = (123, 456);
+        assert_eq!(depth_bounds_key(key, false), key);
+        assert_ne!(depth_bounds_key(key, true), key);
+    }
+
+    #[test]
     fn graphics_blob_key_tracks_shaders_samplers_and_state() {
         unsafe {
             let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
@@ -5222,10 +5239,10 @@ fn create_graphics_pso_cached(
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
+    with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv, false))
 }
 
-unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, depth_bounds: bool) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
@@ -5299,7 +5316,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
-    let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    let gkey = depth_bounds_key(graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers), depth_bounds);
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
     let from_disk = cached.is_none();
@@ -5319,7 +5336,12 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             }
         },
         |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
-        |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
+        |c| if depth_bounds {
+            let stream = depth_bounds_stream(c);
+            let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: stream.0.len(), pPipelineStateSubobjectStream: stream.0.as_ptr() as _ };
+            let create: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+            finish_pso(this, create, &desc as *const _ as _, riid, ppv)
+        } else { finish_pso(this, f, c as *const _ as *const c_void, riid, ppv) },
     );
     let hr = build.hr;
     if build.cache_eligible {
@@ -5770,11 +5792,12 @@ pub(crate) fn prepare_device(device: ID3D12Device) -> usize {
 /// (`prepare_device`) as the title's background build makes it (`build_graphics`): the
 /// translation, DXC and driver blob caches on disk get what the title will ask for. The pipeline
 /// is released; false: not made (noted in the log as the title's would be).
-pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> bool {
+pub(crate) unsafe fn prepare_graphics(device: usize, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, depth_bounds: bool) -> bool {
     let this = device as *mut c_void;
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let mut out: *mut c_void = std::ptr::null_mut();
-    let made = matches!(translated_graphics_pso(this, f, desc as *const _ as *const c_void, &pc_iid(Kind::PipelineState), &mut out), Some(hr) if hr >= 0) && !out.is_null();
+    let hr = with_switch_fallback(|| translated_graphics_pso_once(this, f, desc as *const _ as _, &pc_iid(Kind::PipelineState), &mut out, depth_bounds));
+    let made = matches!(hr, Some(hr) if hr >= 0) && !out.is_null();
     super::pso_async::release(out as usize);
     made
 }
@@ -5993,6 +6016,40 @@ impl StreamOut {
     }
 }
 
+fn depth_bounds_key(mut key: (u64, usize), enabled: bool) -> (u64, usize) {
+    if enabled {
+        for &byte in b"DB01" { key.0 = (key.0 ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3); }
+    }
+    key
+}
+
+/// The richer depth-stencil descriptor can only be passed through a pipeline stream.
+fn depth_bounds_stream(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> StreamOut {
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &d.pRootSignature);
+    for (stage, code) in [(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &d.VS),
+        (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &d.PS), (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, &d.DS),
+        (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, &d.HS), (D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, &d.GS)] {
+        if code.BytecodeLength != 0 { out.put(stage, code); }
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, &super::gfx_records::depth_stencil1(&d.DepthStencilState, true));
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+        &D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats });
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &d.PrimitiveTopologyType);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, &d.IBStripCutValue);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &d.InputLayout);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, &d.StreamOutput);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
+    if d.CachedPSO.CachedBlobSizeInBytes != 0 { out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &d.CachedPSO); }
+    out
+}
+
 /// The subobjects of a stream: (type, payload).
 fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
     let mut out = Vec::new();
@@ -6040,6 +6097,7 @@ unsafe fn record_mesh_stream(stream: &[u8]) -> Option<Vec<u8>> {
     let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
     let mut layout = Vec::with_capacity(subs.len());
     let (mut ms, mut amplification, mut ps) = (None, None, None);
+    let mut depth_bounds = false;
     let (mut seen, mut size) = (0u32, 0usize);
 
     fn value<T: Copy>(payload: &[u8]) -> Option<T> {
@@ -6057,7 +6115,8 @@ unsafe fn record_mesh_stream(stream: &[u8]) -> Option<Vec<u8>> {
         match ty {
             0 => {} // The translator supplies its own root signature.
             19 => continue, // The title's cache blob is never an input to translation.
-            2 | 24 | 25 if payload.iter().all(|&b| b == 0) => continue,
+            24 | 25 if payload.iter().all(|&b| b == 0) => continue,
+            1..=5 if payload.iter().all(|&b| b == 0) => {}
             2 => ps = Some(payload_shader(payload)?),
             24 => amplification = Some(payload_shader(payload)?),
             25 => ms = Some(payload_shader(payload)?),
@@ -6065,6 +6124,16 @@ unsafe fn record_mesh_stream(stream: &[u8]) -> Option<Vec<u8>> {
             9 => desc.SampleMask = value(payload)?,
             10 => desc.RasterizerState = value(payload)?,
             11 => desc.DepthStencilState = value(payload)?,
+            12 if value::<D3D12_INPUT_LAYOUT_DESC>(payload).is_some_and(|d| d.NumElements == 0 && d.pInputElementDescs.is_null()) => {}
+            21 => {
+                let d = value::<D3D12_DEPTH_STENCIL_DESC1>(payload)?;
+                depth_bounds = d.DepthBoundsTestEnable.as_bool();
+                desc.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: d.DepthEnable, DepthWriteMask: d.DepthWriteMask, DepthFunc: d.DepthFunc,
+                    StencilEnable: d.StencilEnable, StencilReadMask: d.StencilReadMask, StencilWriteMask: d.StencilWriteMask,
+                    FrontFace: d.FrontFace, BackFace: d.BackFace,
+                };
+            }
             13 => desc.IBStripCutValue = value(payload)?,
             14 => desc.PrimitiveTopologyType = value(payload)?,
             15 => {
@@ -6092,7 +6161,7 @@ unsafe fn record_mesh_stream(stream: &[u8]) -> Option<Vec<u8>> {
     }
     let shaders = [shader_key(ms), ps.map_or(0, shader_key)];
     let key = shader_set_key(std::iter::once(ms).chain(ps));
-    super::gfx_records::encode_mesh(key, shaders, &layout, &desc)
+    super::gfx_records::encode_mesh(key, shaders, &layout, &desc, depth_bounds)
 }
 
 /// Build both recorded mesh passes on the adopted device from `prepare_device`.
@@ -6117,12 +6186,18 @@ pub(crate) unsafe fn replay_mesh_record(
         let subobject = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(ty as i32);
         match ty {
             0 => stream.put(subobject, &std::ptr::null::<c_void>()),
-            2 => stream.shader(subobject, ps.ok_or("pixel shader missing from the job")?),
+            2 => match ps {
+                Some(bytes) => stream.shader(subobject, bytes),
+                None => stream.put(subobject, &D3D12_SHADER_BYTECODE::default()),
+            },
+            1 | 3..=5 => stream.put(subobject, &D3D12_SHADER_BYTECODE::default()),
             24 | 25 => stream.shader(subobject, ms),
             8 => stream.put(subobject, &d.BlendState),
             9 => stream.put(subobject, &d.SampleMask),
             10 => stream.put(subobject, &d.RasterizerState),
             11 => stream.put(subobject, &d.DepthStencilState),
+            12 => stream.put(subobject, &D3D12_INPUT_LAYOUT_DESC::default()),
+            21 => stream.put(subobject, &super::gfx_records::depth_stencil1(&d.DepthStencilState, record.depth_bounds)),
             13 => stream.put(subobject, &d.IBStripCutValue),
             14 => stream.put(subobject, &d.PrimitiveTopologyType),
             15 => stream.put(subobject, &D3D12_RT_FORMAT_ARRAY { RTFormats: d.RTVFormats, NumRenderTargets: d.NumRenderTargets }),

@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 use crate::hle::d3d12x::gfx_records;
+pub(crate) mod pso_corpus;
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
@@ -812,6 +813,7 @@ struct ShadersOptions {
     measure_pso: Option<u64>,
     repeat: usize,
     precompile: bool,
+    prepare_corpus: bool,
     limit: usize,
     only: Option<String>,
     pipelines: bool,
@@ -850,6 +852,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         measure_pso: None,
         repeat: 1,
         precompile: false,
+        prepare_corpus: false,
         limit: usize::MAX,
         only: None,
         pipelines: false,
@@ -890,6 +893,7 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--measure-pso" => opts.measure_pso = Some(p.parse_hex_u64("--measure-pso")?),
             "--repeat" => opts.repeat = p.parse_usize("--repeat")?,
             "--precompile" => opts.precompile = true,
+            "--prepare-corpus" => opts.prepare_corpus = true,
             "--limit" => opts.limit = p.parse_usize("--limit")?,
             "--only" => opts.only = Some(p.value("--only")?.to_ascii_lowercase()),
             "--pipelines" => opts.pipelines = true,
@@ -953,6 +957,17 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    if opts.prepare_corpus {
+        let progress = LaunchPreparation { adapter: "auto".into(), ..Default::default() };
+        let result = pso_corpus::discover(path)
+            .and_then(|c| c.ok_or_else(|| "No pipeline corpus found in this title folder".to_string()))
+            .and_then(|c| c.prepare_with_threads(&progress, opts.threads))
+            .and_then(|_| progress.check_corpus_complete());
+        return match result {
+            Ok(()) => { println!("Prepared all {} discovered pipeline recipes", progress.done.load(Ordering::Acquire)); 0 }
+            Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
+        };
+    }
     // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
     // (`pso::mem_windows`), as `--precompile`
     let runtime_windows = || {
@@ -960,7 +975,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
     };
     if opts.graphics_records {
-        return graphics_worker(path, runtime_windows());
+        return graphics_worker(path, runtime_windows(), opts.threads);
     }
     let top = opts.top;
     let json = opts.json;
@@ -1568,7 +1583,30 @@ impl Pipelines {
         self.make_one(&c.dxil, &c.samplers, false, path_override);
     }
 
+    fn prepare_compute(&self, blob: &[u8], windows: u32) -> Result<(), String> {
+        let split = recomp::pso::wave32_only_for_device(&self.dev);
+        let program = recomp::pso::console_to_dxil_in(blob, recomp::pso::Stage::Compute, 0, split, windows)?;
+        self.prepare_compiled_compute(&program)
+    }
+
+    fn prepare_compiled_compute(&self, program: &recomp::pso::Compiled) -> Result<(), String> {
+        let make = |dxil: &[u8], chained| {
+            self.make_required(dxil, &program.samplers, chained, None, true)
+        };
+        make(&program.dxil, false)?;
+        if let Some(chain) = program.dispatch_chain.as_deref().filter(|c| c.pieces.len() >= 2) {
+            for piece in &chain.pieces { make(piece, true)?; }
+            make(&program.dxil, true)?;
+        }
+        Ok(())
+    }
+
     fn make_one(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool, path_override: Option<PathBuf>) {
+        let _ = self.make_required(dxil, samplers, chained, path_override, false);
+    }
+
+    fn make_required(&self, dxil: &[u8], samplers: &[recomp::pso::StaticSampler], chained: bool,
+                     path_override: Option<PathBuf>, required: bool) -> Result<(), String> {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: (bool, Vec<u32>) = (chained, samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect());
         let rs = {
@@ -1586,9 +1624,9 @@ impl Pipelines {
                             g.insert(key, rs.clone());
                             rs
                         }
-                        Err(_) => {
+                        Err(e) => {
                             self.refused.fetch_add(1, Ordering::Relaxed);
-                            return;
+                            return Err(format!("Creating compute root signature: {e}"));
                         }
                     }
                 }
@@ -1616,7 +1654,7 @@ impl Pipelines {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return;
+            return Err(format!("Compute DXIL exceeds the native pipeline size limit ({} bytes)", dxil.len()));
         }
         {
             let mut n = self.running.0.lock().unwrap();
@@ -1635,12 +1673,14 @@ impl Pipelines {
         let claim = match (&cached, path.as_deref()) {
             (None, Some(path)) => match Claim::take(path) {
                 Some(c) => Some(c),
+                // A mandatory job needs a native result even if another process owns the cache write.
+                None if required => None,
                 None => {
                     *self.running.0.lock().unwrap() -= 1;
                     self.running.1.notify_one();
                     self.elsewhere.fetch_add(1, Ordering::Relaxed);
                     drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-                    return;
+                    return Err("Another process is preparing this compute pipeline".into());
                 }
             },
             _ => None,
@@ -1664,7 +1704,7 @@ impl Pipelines {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-            return;
+            return Err(format!("The cached compute pipeline was rejected and {} bytes of DXIL exceed the limit", dxil.len()));
         }
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
@@ -1672,7 +1712,7 @@ impl Pipelines {
         } else {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             let pso = unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-            if let (Some(path), Ok(pso)) = (path.as_deref(), &pso) {
+            if let (Some(path), Ok(pso)) = (path.as_deref().filter(|_| claim.is_some() || cached.is_some()), &pso) {
                 if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
                     let bytes = unsafe { blob.GetBufferPointer() }.cast::<u8>();
                     let len = unsafe { blob.GetBufferSize() };
@@ -1687,13 +1727,14 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
+        let done = match &r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
+        r.map(drop).map_err(|e| format!("Creating native compute pipeline ({} bytes of DXIL): {e}", dxil.len()))
     }
 }
 
@@ -1788,10 +1829,35 @@ pub(crate) struct LaunchPreparation {
     pub workers: AtomicUsize,
     /// The workers build graphics pipelines (`graphics_in_workers`): `done` and `total` count those.
     pub graphics: std::sync::atomic::AtomicBool,
-    /// The shaders earlier runs used (`pso_async::earlier_used_shaders`), when there are any:
-    /// only their records are translated before the title starts, and it translates another
-    /// when it first uses it. `XCL_PREPARE_ALL=1`: every record, as without the list.
-    pub only: Option<HashSet<u64>>,
+    /// While replaying the discovered corpus, only verified native successes advance `done`.
+    pub corpus: std::sync::atomic::AtomicBool,
+}
+
+impl LaunchPreparation {
+    pub(crate) fn begin_corpus(&self, total: usize) {
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+        self.corpus.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn complete_corpus(&self, count: usize) -> Result<(), String> {
+        if self.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()); }
+        if !self.corpus.load(Ordering::Acquire) || count > self.total.load(Ordering::Relaxed) {
+            return Err("Native completion count exceeds the discovered corpus".into());
+        }
+        self.done.fetch_max(count, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn check_corpus_complete(&self) -> Result<(), String> {
+        if self.cancel.load(Ordering::Relaxed) { return Err("Pipeline preparation cancelled".into()); }
+        let done = self.done.load(Ordering::Acquire);
+        let total = self.total.load(Ordering::Relaxed);
+        if !self.corpus.load(Ordering::Acquire) || total == 0 || done != total {
+            return Err(format!("Native pipeline preparation incomplete: {done} of {total} recipes confirmed"));
+        }
+        Ok(())
+    }
 }
 
 /// Unpacked shader containers in the title's shaders directory. Do not follow directory
@@ -1813,6 +1879,16 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 }
 
 pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+    let corpus = pso_corpus::discover(root)?;
+    prepare_title_inputs(root, progress)?;
+    if let Some(corpus) = corpus {
+        corpus.prepare(progress)?;
+        progress.check_corpus_complete()?;
+    }
+    Ok(())
+}
+
+fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
     let mut inputs = Vec::new();
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
@@ -1846,11 +1922,6 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
         precompile(input, usize::MAX, windows, None, None, true, None, None, std::time::Instant::now(), Some(progress))?;
     }
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-    // `XCL_PREPARE_GRAPHICS=0`: the title builds the graphics pipelines it uses as it goes
-    if std::env::var("XCL_PREPARE_GRAPHICS").is_ok_and(|v| v.trim() == "0") {
-        crate::xlog_info!("Shader preparation: graphics pipelines left out (XCL_PREPARE_GRAPHICS=0)");
-        return Ok(());
-    }
     graphics_in_workers(&inputs, windows, workers, progress)
 }
 
@@ -1943,17 +2014,17 @@ mod claim_tests {
 /// what is missing itself.
 fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let used_only = !crate::hle::d3d12x::pso_async::earlier_used_keys().is_empty();
     let t0 = std::time::Instant::now();
-    crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
+    crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes");
     let (cancelled, failed, _) = in_workers(workers, records, progress, |i| {
         let mut c = worker_command(&me);
         c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
-        if used_only { c.arg("--used-only"); }
+        if std::env::var_os("XCL_ADAPTER").is_none() && !progress.adapter.is_empty() { c.env("XCL_ADAPTER", &progress.adapter); }
         c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
         c
     });
     if cancelled { return Err("Shader preparation cancelled".into()); }
+    if failed != 0 { return Err(format!("{failed} of {workers} compute pipeline workers failed")); }
     crate::xlog_info!("Shader preparation: compute pipelines done in {:.0} s ({failed} of {workers} workers failed)", t0.elapsed().as_secs_f64());
     Ok(())
 }
@@ -2021,7 +2092,7 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
-    let mut failed = 0;
+    let mut failed = workers - children.len();
     for (i, child) in children.iter_mut() {
         match child.wait() {
             Ok(st) if st.success() => {}
@@ -2045,23 +2116,44 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
 /// starts all the same: it builds what is missing itself.
 fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress: &LaunchPreparation) -> Result<(), String> {
     let t0 = std::time::Instant::now();
-    let payloads = gfx_records::read(&gfx_records::path());
-    let records: Vec<_> = payloads.into_iter().filter_map(|payload| {
-        let record = GraphicsHistoryRecord::from_entry(gfx_records::decode(&payload)?)?;
-        Some((payload, record))
-    }).collect();
+    let path = gfx_records::path();
+    let local = if path.try_exists().map_err(|e| e.to_string())? { gfx_records::read_complete_payloads(&path)? } else { Vec::new() };
+    let mut records = Vec::new();
+    let mut embedded = std::collections::HashMap::new();
+    for payload in local {
+        match gfx_records::decode(&payload).ok_or("Unrecognized graphics history entry")? {
+            gfx_records::Entry::Shader(key, code) => {
+                if crate::hle::d3d12x::real::shader_key(&code) != key {
+                    return Err(format!("Graphics history shader {key:016x} failed its identity check"));
+                }
+                embedded.insert(key, code);
+            }
+            entry => if let Some(record) = GraphicsHistoryRecord::from_entry(entry) { records.push((payload, record)); },
+        }
+    }
+    let local_count = records.len();
+    let legacy = gfx_records::shared_history_path();
+    if !inputs.is_empty() && legacy != path {
+        let scoped: HashSet<_> = records.iter().map(|(bytes, _)| bytes.as_slice()).collect();
+        let candidates: Vec<_> = gfx_records::read(&legacy).into_iter().filter(|bytes| !scoped.contains(bytes.as_slice()))
+            .filter_map(|payload| Some((GraphicsHistoryRecord::from_entry(gfx_records::decode(&payload)?)?, payload))).collect();
+        records.extend(candidates.into_iter().map(|(record, payload)| (payload, record)));
+    }
     if records.is_empty() {
         crate::xlog_info!("Shader preparation: no graphics pipelines of an earlier run to build");
         return Ok(());
     }
     let wanted = records.iter().flat_map(|(_, record)| record.identity().1.iter().copied())
-        .filter(|&key| key != 0).collect();
-    let shaders = shaders_by_key(inputs, wanted, progress);
+        .filter(|&key| key != 0 && !embedded.contains_key(&key)).collect();
+    let mut shaders = shaders_by_key(inputs, wanted, progress);
+    shaders.extend(embedded);
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
     let (buildable, missing) = buildable(records.iter().map(|(_, r)| r), &shaders);
-    if missing != 0 {
-        crate::xlog_info!("Shader preparation: {missing} of {} graphics pipelines left out (their shaders are not in the title's shader files)", records.len());
+    let local_missing = local_count - buildable.iter().take_while(|&&i| i < local_count).count();
+    if local_missing != 0 {
+        return Err(format!("{local_missing} of {local_count} title graphics recipes lack matching shader sources"));
     }
+    if missing != 0 { crate::xlog_info!("Shader preparation: {missing} shared graphics recipes have no matching shaders in this title"); }
     if buildable.is_empty() { return Ok(()); }
     let workers = workers.clamp(1, buildable.len());
     // each worker's part, with the shaders it needs (removed when they are done)
@@ -2095,6 +2187,10 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
     for (path, _) in &jobs { let _ = std::fs::remove_file(path); }
     if cancelled { return Err("Shader preparation cancelled".into()); }
     let sum = summaries.iter().filter_map(|s| graphics_summary(s)).fold([0usize; 4], |a, b| std::array::from_fn(|k| a[k] + b[k]));
+    if failed != 0 || sum[1] != 0 || sum[0] != buildable.len() {
+        return Err(format!("Graphics preparation incomplete: {} of {} confirmed, {} refused, {failed} workers failed",
+            sum[0], buildable.len(), sum[1]));
+    }
     crate::xlog_info!(
         "Shader preparation: graphics pipelines done in {:.0} s: {} made, {} failed; driver blobs: {} from disk, {} kept ({failed} of {workers} workers failed)",
         t0.elapsed().as_secs_f64(), sum[0], sum[1], sum[2], sum[3]
@@ -2170,59 +2266,84 @@ fn graphics_summary(line: &str) -> Option<[usize; 4]> {
     n.next().is_none().then_some(out)
 }
 
+fn corpus_threads(requested: Option<usize>, default: usize) -> usize {
+    requested.or_else(|| std::env::var("XCL_PIPELINE_THREADS").ok()?.parse().ok()).unwrap_or(default).clamp(1, 32)
+}
+
 /// `xcl shaders <job> --graphics-records` (a worker of `graphics_in_workers`): the graphics
 /// pipelines of a job file built as the title builds them, with the
 /// title's memory windows (`windows`) and on its adapter (`XCL_ADAPTER`), `XCL_PIPELINE_THREADS`
 /// at a time. A progress line a pipeline, then the summary `graphics_summary` reads.
-fn graphics_worker(job: &Path, windows: u32) -> i32 {
+fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
     use crate::hle::d3d12x::real;
     end_with_parent();
+    let mut shaders = std::collections::HashMap::new();
+    let mut records = Vec::new();
+    let entries = match gfx_records::read_job(job) {
+        Ok(entries) => entries,
+        Err(e) => { eprintln!("xcl shaders: {}: {e}", job.display()); return 2; }
+    };
+    for entry in entries {
+        match entry {
+            gfx_records::Entry::Shader(key, code) => {
+                if real::shader_key(&code) != key || shaders.get(&key).is_some_and(|prior| prior != &code) {
+                    eprintln!("xcl shaders: invalid or conflicting shader {key:016x} in {}", job.display());
+                    return 2;
+                }
+                shaders.insert(key, code);
+            }
+            entry => records.extend(GraphicsHistoryRecord::from_entry(entry)),
+        }
+    }
+    let n = records.len();
+    let (ready, missing) = buildable(records.iter(), &shaders);
+    if missing != 0 { eprintln!("xcl shaders: {missing} graphics records have missing or mismatched shaders"); }
+    if ready.is_empty() {
+        eprintln!("graphics pipelines: 0 made, {missing} failed; driver blobs: 0 from disk, 0 kept");
+        return if missing == 0 { 0 } else { 2 };
+    }
     // (no title memory here: its windows are given)
     crate::gpu::uma::leave_out();
     recomp::pso::set_title_windows(windows);
     recomp::dxc::set_memory_reserve(2);
-    let mut shaders = std::collections::HashMap::new();
-    let mut records = Vec::new();
-    for p in gfx_records::read(job) {
-        match gfx_records::decode(&p) {
-            Some(gfx_records::Entry::Shader(key, code)) => { shaders.insert(key, code); }
-            Some(entry) => records.extend(GraphicsHistoryRecord::from_entry(entry)),
-            None => {}
-        }
-    }
     let device = match Pipelines::for_adapter("auto") {
         Ok(p) => real::prepare_device(p.dev),
         Err(e) => { eprintln!("xcl shaders: no pipeline device: {e}"); return 2; }
     };
-    let n = records.len();
-    let threads = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 8);
-    let (next, done, made, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let threads = corpus_threads(requested, 1).min(ready.len());
+    let (next, made, failed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(missing));
     let t0 = std::time::Instant::now();
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(r) = records.get(i) else { break };
+                let Some(&index) = ready.get(i) else { break };
+                let r = &records[index];
                 let code = |key| shaders.get(&key).map(Vec::as_slice);
                 // (a pipeline that panics fails; the others are built)
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match r {
                     GraphicsHistoryRecord::Legacy(record) => {
                         let desc = record.desc(record.shaders.map(code));
-                        unsafe { real::prepare_graphics(device, &desc) }
+                        unsafe { real::prepare_graphics(device, &desc, record.depth_bounds) }
                     }
                     GraphicsHistoryRecord::Mesh(record) => {
                         unsafe { real::replay_mesh_record(device, record, record.shaders.map(code)).is_ok() }
                     }
                 })).unwrap_or(false);
-                if ok { made.fetch_add(1, Ordering::Relaxed); } else { failed.fetch_add(1, Ordering::Relaxed); }
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                if ok {
+                    let d = made.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                } else {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("xcl shaders: failed graphics record {} (shader set {:016x})", index + 1, r.identity().0);
+                }
             });
         }
     });
     let (hits, _, stored) = real::driver_cache_stats();
-    eprintln!("graphics pipelines: {} made, {} failed; driver blobs: {hits} from disk, {stored} kept", made.into_inner(), failed.into_inner());
-    0
+    let failed = failed.into_inner();
+    eprintln!("graphics pipelines: {} made, {failed} failed; driver blobs: {hits} from disk, {stored} kept", made.into_inner());
+    if failed == 0 { 0 } else { 2 }
 }
 
 /// `XCL_PRECOMPILE_PARENT=pid` (set for a title's preparation workers): this process ends when
@@ -2246,13 +2367,14 @@ fn end_with_parent() {
 
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, selected: Option<&std::collections::HashSet<u64>>, pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
     if startup.is_none() { end_with_parent(); }
+    let mandatory = startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some();
     let pipelines = if pipelines {
         let mut p = Pipelines::for_adapter(startup.map_or("auto", |p| p.adapter.as_str()))
             .map_err(|e| format!("No pipeline device: {e}"))?;
         if let Some(threads) = pipeline_threads {
             p.most = threads.max(1);
         }
-        if startup.is_some() && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
+        if mandatory && std::env::var_os("XCL_PIPELINE_MAX_KB").is_none() {
             p.max_dxil = 0;
         }
         Some(p)
@@ -2273,7 +2395,6 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let unused = AtomicUsize::new(0);
     let matched: Mutex<std::collections::HashSet<u64>> = Mutex::new(Default::default());
     let pipeline_jobs: Mutex<Vec<PipelineJob>> = Mutex::new(Vec::new());
     let used_earlier = if pipelines.is_some() && startup.is_none() {
@@ -2342,21 +2463,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     record_done();
                     continue;
                 }
-                if startup.and_then(|p| p.only.as_ref()).is_some_and(|used| !used.contains(&crate::hle::d3d12x::real::shader_key(&blob))) {
-                    unused.fetch_add(1, Ordering::Relaxed);
-                    record_done();
-                    continue;
-                }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
-                                if startup.is_some() {
-                                    p.make(&c);
-                                    if c.dispatch_chain.as_ref().is_some_and(|plan| plan.pieces.len() >= 2) {
-                                        p.make_one(&c.dxil, &c.samplers, true, None);
+                                if mandatory {
+                                    if let Err(e) = p.prepare_compiled_compute(&c) {
+                                        failed.fetch_add(1, Ordering::Relaxed);
+                                        let mut logs = errors.lock().unwrap();
+                                        if logs.len() < 10 { logs.push(format!("{name}: {e}")); }
+                                        record_done();
+                                        continue;
                                     }
                                 } else {
                                     let used = used_earlier.contains(&pipeline_key(&blob));
@@ -2465,8 +2584,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     let errors = errors.into_inner().unwrap();
     for e in &errors { println!("  {e}"); }
-    if let Some(progress) = startup {
-        if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
+    if mandatory {
+        if startup.is_some_and(|p| p.cancel.load(Ordering::Relaxed)) { return Err("Shader preparation cancelled".into()); }
         // (no pipelines here when worker processes build them: `pipelines_in_workers`)
         let refused = pipelines.map_or(0, |p| p.refused.load(Ordering::Relaxed));
         let capped = pipelines.map_or(0, |p| p.capped.load(Ordering::Relaxed));
@@ -2859,7 +2978,7 @@ mod tests {
         let both = [shader_key(&vs), shader_key(&ps), 0, 0, 0];
         let mesh = |key, shaders| {
             let layout = [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32];
-            let payload = encode_mesh(key, shaders, &layout, &desc).unwrap();
+            let payload = encode_mesh(key, shaders, &layout, &desc, false).unwrap();
             GraphicsHistoryRecord::from_entry(decode(&payload).unwrap()).unwrap()
         };
         let records = [
@@ -2872,6 +2991,36 @@ mod tests {
         ];
         let shaders = HashMap::from([(shader_key(&vs), vs), (shader_key(&ps), ps), (shader_key(&ms), ms)]);
         assert_eq!(buildable(records.iter(), &shaders), (vec![0, 1, 4], 3));
+    }
+
+    #[test]
+    fn a_graphics_job_with_a_missing_or_incorrectly_named_shader_fails() {
+        use crate::hle::d3d12x::gfx_records::{encode_mesh, shader_entry, Writer};
+        use crate::hle::d3d12x::real::shader_key;
+        let path = std::env::temp_dir().join(format!("xcl-graphics-missing-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let bytes = b"mesh";
+        let key = shader_key(bytes);
+        {
+            let mut job = Writer::open(&path, u64::MAX).unwrap();
+            job.add(&encode_mesh(key, [key, 0], &[25], &Default::default(), false).unwrap()).unwrap();
+        }
+        assert_eq!(graphics_worker(&path, 1, Some(1)), 2);
+        {
+            let mut job = Writer::open(&path, u64::MAX).unwrap();
+            job.add(&shader_entry(key, b"different mesh")).unwrap();
+        }
+        assert_eq!(graphics_worker(&path, 1, Some(1)), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_pipeline_worker_counts_can_use_all_thirty_two_slots() {
+        for count in [1, 2, 8, 16, 32] {
+            assert_eq!(corpus_threads(Some(count), 1), count);
+        }
+        assert_eq!(corpus_threads(Some(0), 1), 1);
+        assert_eq!(corpus_threads(Some(33), 1), 32);
     }
 
     /// `--used-only` keeps a compute program exactly when the runtime noted its pipeline: the

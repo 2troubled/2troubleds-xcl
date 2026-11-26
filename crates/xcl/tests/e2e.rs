@@ -48,6 +48,26 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+#[test]
+fn incomplete_discovered_corpus_blocks_headless_title_entry() {
+    let xcl = Path::new(env!("CARGO_BIN_EXE_xcl"));
+    let root = temp_dir("incomplete-corpus");
+    let game = root.join("game");
+    let data = root.join("data");
+    copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/testgame"), &game);
+    std::fs::copy(xcl.parent().unwrap().join("xcl_testtitle.exe"), game.join("xcl_testtitle.exe")).unwrap();
+    std::fs::create_dir_all(game.join(".xcl/pso-corpus")).unwrap();
+    let settings = data.join("XCL.TestTitle");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(settings.join("xcl.toml"), "graphics='null'\npresent='off'\n").unwrap();
+    let out = Command::new(xcl).arg("run").arg(&game).env("XCL_DATA_ROOT", &data)
+        .env("XCL_PREPARE", "0").env("XCL_PREPARE_GRAPHICS", "0").output().unwrap();
+    assert!(!out.status.success(), "An incomplete corpus released the guest");
+    let log = std::fs::read_to_string(settings.join("logs/xcl.log")).unwrap();
+    assert!(log.contains("Incomplete pipeline corpus"), "{log}");
+    assert!(!log.contains("game entry point returned"), "{log}");
+}
+
 struct TempDir(PathBuf);
 
 impl std::ops::Deref for TempDir {
