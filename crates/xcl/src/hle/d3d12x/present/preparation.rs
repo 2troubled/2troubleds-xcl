@@ -49,7 +49,12 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
         crate::xlog_info!("Shader preparation left out (XCL_PREPARE=0): the title builds what it uses as it goes");
         return Ok(());
     }
-    let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });
+    let only = Some(crate::hle::d3d12x::pso_async::earlier_used_shaders())
+        .filter(|used| !used.is_empty() && !std::env::var("XCL_PREPARE_ALL").is_ok_and(|v| v.trim() == "1"));
+    if let Some(used) = &only {
+        crate::xlog_info!("Shader preparation: only the {} shaders earlier runs used (XCL_PREPARE_ALL=1: every record)", used.len());
+    }
+    let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), only, ..Default::default() });
     let hwnd = if super::enabled() {
         *SCREEN.lock().unwrap() = Some(Screen { progress: progress.clone(), start: Instant::now(), clock: StallClock::default(), ready: false });
         ACTIVE.store(true, Ordering::Release);
