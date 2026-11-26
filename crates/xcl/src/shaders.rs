@@ -2482,6 +2482,12 @@ fn end_with_parent() {
     });
 }
 
+fn precompile_slice(startup_owner: bool, value: Option<&str>) -> Option<(usize, usize)> {
+    if startup_owner { return None; }
+    let (i, n) = value?.split_once('/')?;
+    Some((i.trim().parse().ok()?, n.trim().parse::<usize>().ok().filter(|n| *n > 0)?))
+}
+
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, selected: Option<&std::collections::HashSet<u64>>, pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>, coverage: Option<&ComputeCoverage>) -> Result<(), String> {
     if startup.is_none() { end_with_parent(); }
     let mandatory = startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some();
@@ -2502,10 +2508,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let n = input.len().min(limit);
     // `XCL_PRECOMPILE_SLICE=i/n` (experiment): this process takes only every n-th shader, from the
     // i-th, so n processes share the work and each has its own driver compiler
-    let slice: Option<(usize, usize)> = std::env::var("XCL_PRECOMPILE_SLICE").ok().and_then(|v| {
-        let (i, n) = v.split_once('/')?;
-        Some((i.trim().parse().ok()?, n.trim().parse::<usize>().ok().filter(|n| *n > 0)?))
-    });
+    let slice = precompile_slice(startup.is_some(), std::env::var("XCL_PRECOMPILE_SLICE").ok().as_deref());
     // a progress line every 200 records; every record for a title waiting on this builder
     // (`pipelines_in_workers` shows the count)
     let every = if std::env::var_os("XCL_PRECOMPILE_PARENT").is_some() { 1 } else { 200 };
@@ -3246,6 +3249,16 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         assert!(parent.covers(3, &blob).is_err(), "missing staged data cannot satisfy a recipe");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launch_owner_ignores_inherited_slices_and_workers_drop_foreign_coverage() {
+        assert_eq!(precompile_slice(true, Some("1/2")), None);
+        assert_eq!(precompile_slice(false, Some("1/2")), Some((1, 2)));
+        let command = worker_command(Path::new("xcl.exe"));
+        for name in [COVERAGE_MAP, COVERAGE_DIR] {
+            assert!(command.get_envs().any(|(key, value)| key == name && value.is_none()));
+        }
     }
 
     #[test]
