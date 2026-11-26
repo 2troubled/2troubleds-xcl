@@ -101,3 +101,22 @@ pub(crate) fn dxil_part(kind: u32, fssms: &[Vec<u8>]) -> Vec<u8> {
     v.extend_from_slice(b"NOBC");
     v
 }
+
+// Some integration crates only need the container builders.
+#[allow(dead_code)]
+pub(crate) fn mesh_psv(max_v: u16, max_p: u16, threads: [u32; 3], wave_lanes: [u32; 2]) -> Vec<u8> {
+    let mut r = vec![0u8; 48];
+    r[12..14].copy_from_slice(&max_v.to_le_bytes());
+    r[14..16].copy_from_slice(&max_p.to_le_bytes());
+    r[16..20].copy_from_slice(&wave_lanes[0].to_le_bytes());
+    r[20..24].copy_from_slice(&wave_lanes[1].to_le_bytes());
+    r[24] = 13; // MS
+    r[27] = 2; // triangles
+    r[36..40].copy_from_slice(&threads[0].to_le_bytes());
+    r[40..44].copy_from_slice(&threads[1].to_le_bytes());
+    r[44..48].copy_from_slice(&threads[2].to_le_bytes());
+    let mut p = 48u32.to_le_bytes().to_vec();
+    p.extend_from_slice(&r);
+    le32(&mut p, 0);
+    p
+}

@@ -766,7 +766,7 @@ pub fn root_layout(d: &[u8], stage: &HwStage) -> Result<RootLayout, String> {
 
 #[cfg(test)]
 #[path = "../../tests/common/shader_container.rs"]
-mod shader_container;
+pub(crate) mod shader_container;
 
 #[cfg(test)]
 pub(crate) mod tests {

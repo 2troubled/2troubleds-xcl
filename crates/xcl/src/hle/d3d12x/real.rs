@@ -4601,9 +4601,13 @@ pub(crate) mod driver_cache {
         ok
     }
 
+    pub(super) fn worth_keeping(took: std::time::Duration) -> bool {
+        took >= KEEP || keep_fixtures()
+    }
+
     /// Keep `blob`, of a build that took `took`, for the next run.
     pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
-        if (took >= KEEP || keep_fixtures()) && write(p, blob) {
+        if worth_keeping(took) && write(p, blob) {
             let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
@@ -6067,8 +6071,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         }
     };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let create_mesh = |label, blob: Option<&[u8]>, out: *mut *mut c_void| {
-        *out = std::ptr::null_mut();
+    let create_mesh = |label, blob: Option<&[u8]>| {
         let mut cached_stream;
         let stream = if let Some(blob) = blob {
             cached_stream = StreamOut(stream.0.clone(), stream.1);
@@ -6080,14 +6083,20 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             stream
         };
         let desc = [stream.0.len(), stream.0.as_ptr() as usize];
-        driver_compile_identified(label, mesh_bytes, false, None, || finish_pso(this, fs, desc.as_ptr().cast(), riid, out))
+        let mut raw = std::ptr::null_mut();
+        let (hr, took) = driver_compile_identified(label, mesh_bytes, false, None, || {
+            finish_pso(this, fs, desc.as_ptr().cast(), riid, &mut raw)
+        });
+        let pso = (!raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw));
+        (hr, pso, took)
     };
     if gcached.is_none() {
         take_cold_slot();
     }
-    let (mut hr, mut gin_driver) = create_mesh(kind, gcached.as_deref().map(Vec::as_slice), ppv);
+    let (mut hr, mut mesh_pso, mut gin_driver) = create_mesh(kind, gcached.as_deref().map(Vec::as_slice));
     let mut greused = gcached.is_some();
-    if let Some((key, blob)) = gkey.zip(gcached.as_ref()).filter(|_| hr < 0 || (*ppv).is_null()) {
+    if let Some((key, blob)) = gkey.zip(gcached.as_ref()).filter(|_| hr < 0 || mesh_pso.is_none()) {
+        drop(mesh_pso.take());
         if gfrom_disk || forget_graphics_blob(key, blob) {
             let rejected_path = gdisk.as_deref().filter(|p| {
                 gfrom_disk || driver_cache::load(p).as_deref() == Some(blob.as_ref())
@@ -6095,15 +6104,13 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             driver_cache::note(false, rejected_path);
         }
         take_cold_slot();
-        (hr, gin_driver) = create_mesh("mesh pass retry", None, ppv);
+        (hr, mesh_pso, gin_driver) = create_mesh("mesh pass retry", None);
         greused = false;
     }
-    if hr < 0 || (*ppv).is_null() {
+    let Some(mesh_pso) = mesh_pso.filter(|_| hr >= 0) else {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
-    }
-    let mesh_pso = ID3D12PipelineState::from_raw(*ppv);
-    *ppv = std::ptr::null_mut();
+    };
     if let Some(key) = gkey {
         if greused {
             if let Some(blob) = gcached.filter(|_| gfrom_disk) {
@@ -6111,9 +6118,15 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
                 driver_cache::note(true, None);
             }
         } else {
-            keep_graphics_blob(key, mesh_pso.as_raw(), mesh_bytes);
-            if let (Some(p), Some(blob)) = (gdisk.as_deref(), graphics_blob(key)) {
-                driver_cache::keep(p, &blob, gin_driver);
+            let slow = driver_cache::worth_keeping(gin_driver);
+            if slow || mesh_bytes >= COMPUTE_BLOB_MIN_DXIL {
+                let blob = graphics_blob(key).or_else(|| read_pso_cached_blob(mesh_pso.as_raw()).map(std::sync::Arc::new));
+                if let Some(blob) = blob {
+                    if let Some(path) = gdisk.as_deref().filter(|_| slow) {
+                        driver_cache::keep(path, &blob, gin_driver);
+                    }
+                    remember_graphics_blob(key, blob);
+                }
             }
         }
     }

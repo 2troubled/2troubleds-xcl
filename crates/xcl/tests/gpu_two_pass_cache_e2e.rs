@@ -3,7 +3,7 @@
 #[path = "common/shader_container.rs"]
 mod shader_container;
 
-use shader_container::{container, dxil_part, fssm, le32};
+use shader_container::{container, dxil_part, fssm, le32, mesh_psv};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -40,23 +40,6 @@ fn sig_part(entries: &[(&str, u32, u32, u32, u8)]) -> Vec<u8> {
     }
     d.extend_from_slice(&names);
     d
-}
-
-fn mesh_psv(max_v: u16, max_p: u16, threads: [u32; 3]) -> Vec<u8> {
-    let mut r = vec![0u8; 48];
-    r[12..14].copy_from_slice(&max_v.to_le_bytes());
-    r[14..16].copy_from_slice(&max_p.to_le_bytes());
-    r[16..20].copy_from_slice(&64u32.to_le_bytes());
-    r[20..24].copy_from_slice(&64u32.to_le_bytes());
-    r[24] = 13; // MS
-    r[27] = 2; // triangles
-    r[36..40].copy_from_slice(&threads[0].to_le_bytes());
-    r[40..44].copy_from_slice(&threads[1].to_le_bytes());
-    r[44..48].copy_from_slice(&threads[2].to_le_bytes());
-    let mut p = 48u32.to_le_bytes().to_vec();
-    p.extend_from_slice(&r);
-    le32(&mut p, 0);
-    p
 }
 
 fn gs_psv(max_v: u16) -> Vec<u8> {
@@ -109,7 +92,7 @@ fn ms_code(alt: bool) -> Vec<u8> {
 
 fn synthetic_ms_container(alt: bool) -> Vec<u8> {
     let osg1 = sig_part(&[("SV_Position", 1, 3, 0, 0xF), ("TEXCOORD", 0, 3, 1, 0xF)]);
-    let psv0 = mesh_psv(128, 128, [128, 1, 1]);
+    let psv0 = mesh_psv(128, 128, [128, 1, 1], [64, 64]);
     let dxil = dxil_part(13, &[fssm(&ms_code(alt), &[(7, 6)])]);
     container(&[(b"SFI0", &[0; 8]), (b"OSG1", &osg1), (b"PSV0", &psv0), (b"HASH", &[0; 20]), (b"DXIL", &dxil)])
 }
