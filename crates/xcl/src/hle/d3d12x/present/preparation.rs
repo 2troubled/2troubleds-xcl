@@ -43,9 +43,9 @@ pub(crate) fn before_guest(boot: &Boot) -> Result<(), String> {
     std::env::remove_var("XCL_PREPARATION_MENU");
     let root = &boot.game_root;
     let corpus = root.join(".xcl/pso-corpus").try_exists().map_err(|e| e.to_string())?;
-    if !corpus && (boot.config.graphics.eq_ignore_ascii_case("null") ||
-        (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir() &&
-         !crate::hle::d3d12x::gfx_records::path().try_exists().map_err(|e| e.to_string())?)) {
+    let history = crate::hle::d3d12x::gfx_records::path().try_exists().map_err(|e| e.to_string())?;
+    if !corpus && !history && (boot.config.graphics.eq_ignore_ascii_case("null") ||
+        (!root.join("shaders.rpf").try_exists().map_err(|e| e.to_string())? && !root.join("shaders").is_dir())) {
         return Ok(());
     }
     let progress = Arc::new(LaunchPreparation { adapter: boot.config.d3d12_adapter.clone(), ..Default::default() });

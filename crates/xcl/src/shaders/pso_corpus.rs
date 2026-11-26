@@ -1,5 +1,5 @@
 //! A staged set of native graphics and compute recipes, shared by startup and offline preparation.
-use super::{gfx_records, graphics_summary, progress_count, recomp, worker_command, LaunchPreparation, Pipelines};
+use super::{graphics_summary, progress_count, recomp, worker_command, LaunchPreparation, Pipelines};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,16 +23,16 @@ pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
     let encoded = encoded.trim().parse::<u8>().map_err(|_| "Invalid corpus memory window count")?;
     let count = (encoded & 127) as usize;
     let heap = encoded & 128 != 0;
-    if !recomp::valid_window_count(count, heap) || heap && count <= 1 {
+    if count == 0 || !recomp::valid_window_count(count, heap) || heap && count <= 1 {
         return Err(format!("Invalid corpus memory window configuration {encoded}"));
     }
     let windows = count as u32 | if heap { recomp::HEAP_WINDOWS } else { 0 };
     let path = dir.join("graphics.bin");
     let graphics = if path.try_exists().map_err(|e| e.to_string())? {
-        let entries = gfx_records::read_job(&path)?;
-        let count = entries.iter().filter(|e| !matches!(e, gfx_records::Entry::Shader(..))).count();
-        if count == 0 { return Err("Graphics job contains no pipeline records".into()); }
-        Some((path, count))
+        if expected[0] == 0 { return Err("Unexpected graphics job in compute-only corpus".into()); }
+        // The worker validates and decodes the job. Require its independent native-success
+        // count to match the marker before handoff, without loading the job twice.
+        Some((path, expected[0]))
     } else { None };
     let mut compute = Vec::new();
     let folder = dir.join("compute");
@@ -65,7 +65,8 @@ impl Corpus {
 
     pub(super) fn prepare_with_threads(&self, progress: &LaunchPreparation, requested: Option<usize>) -> Result<(), String> {
         let graphics_count = self.graphics.as_ref().map_or(0, |(_, n)| *n);
-        progress.begin_corpus(graphics_count + self.compute.len());
+        let total = graphics_count.checked_add(self.compute.len()).ok_or("Pipeline corpus count overflow")?;
+        progress.begin_corpus(total);
         let count = self.windows & !recomp::HEAP_WINDOWS;
         let runtime = crate::gpu::uma::configured_runtime_windows();
         if count as usize != runtime || (self.windows & recomp::HEAP_WINDOWS != 0) != (runtime > 1 && recomp::pso::heap_windows()) {
@@ -181,6 +182,8 @@ mod tests {
         assert_eq!(corpus.compute[0].0, 16);
         assert_eq!(corpus.windows, 1);
         std::fs::write(dir.join("windows"), "255").unwrap();
+        assert!(discover(&root).is_err());
+        std::fs::write(dir.join("windows"), "0").unwrap();
         assert!(discover(&root).is_err());
     }
 }

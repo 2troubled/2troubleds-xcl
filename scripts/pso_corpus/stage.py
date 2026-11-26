@@ -181,7 +181,8 @@ def build(journals, dest, spool, records):
             if tag == "S":
                 require(win == 0 and data, "invalid shader frame")
             else:
-                require(1 <= (win & 127) <= (16 if win & 128 else 4), "invalid window count")
+                count = win & 127
+                require(count in ((2, 3, 4, 8, 16) if win & 128 else (1, 2, 3, 4)), "invalid window count")
             digest = hashlib.sha256(data).digest()
             identity = tag, key
             if identity in seen:

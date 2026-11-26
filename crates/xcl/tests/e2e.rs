@@ -60,11 +60,19 @@ fn incomplete_discovered_corpus_blocks_headless_title_entry() {
     let settings = data.join("XCL.TestTitle");
     std::fs::create_dir_all(&settings).unwrap();
     std::fs::write(settings.join("xcl.toml"), "graphics='null'\npresent='off'\n").unwrap();
-    let out = Command::new(xcl).arg("run").arg(&game).env("XCL_DATA_ROOT", &data)
+    let launch = || Command::new(xcl).arg("run").arg(&game).env("XCL_DATA_ROOT", &data)
         .env("XCL_PREPARE", "0").env("XCL_PREPARE_GRAPHICS", "0").output().unwrap();
+    let out = launch();
     assert!(!out.status.success(), "An incomplete corpus released the guest");
     let log = std::fs::read_to_string(settings.join("logs/xcl.log")).unwrap();
     assert!(log.contains("Incomplete pipeline corpus"), "{log}");
+    assert!(!log.contains("game entry point returned"), "{log}");
+    std::fs::remove_dir(game.join(".xcl/pso-corpus")).unwrap();
+    std::fs::create_dir_all(settings.join("cache")).unwrap();
+    std::fs::write(settings.join("cache/used-graphics-pipelines.bin"), b"bad history").unwrap();
+    assert!(!launch().status.success());
+    let log = std::fs::read_to_string(settings.join("logs/xcl.log")).unwrap();
+    assert!(log.contains("unrecognized graphics job header"), "{log}");
     assert!(!log.contains("game entry point returned"), "{log}");
 }
 

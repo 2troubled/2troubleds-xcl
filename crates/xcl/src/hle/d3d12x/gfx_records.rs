@@ -4,7 +4,7 @@
 //! driver's blobs on disk. `used-pipelines.txt` holds only the keys of the shader sets and the
 //! driver cache only blobs named after the translated DXIL: neither is enough to make one again.
 //!
-//! `used-graphics-pipelines.bin` beside the DXIL cache:
+//! `used-graphics-pipelines.bin` in the title's cache (older runs used the shared DXIL cache):
 //!
 //! ```text
 //! file     = "XCLGFXP\0", version u32, entry*
@@ -485,10 +485,32 @@ pub(crate) fn read(path: &Path) -> Vec<Vec<u8>> {
 /// A completed worker job must contain only whole, supported records. A history file
 /// may be open for appends, so its reader above accepts a trailing partial entry.
 fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Result<Vec<T>, String> {
-    let file = std::fs::read(path).map_err(|e| e.to_string())?;
-    let (payloads, end) = payloads(&file).ok_or("unrecognized graphics job header")?;
-    if end != file.len() { return Err(format!("damaged graphics job at byte {end}")); }
-    payloads.into_iter().enumerate().map(|(i, p)| decode(p).map(|entry| take(p, entry)).ok_or_else(|| format!("invalid graphics job entry {}", i + 1))).collect()
+    use std::io::{BufReader, Read};
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let mut reader = BufReader::new(file);
+    let mut magic = [0; HEADER];
+    if reader.read_exact(&mut magic).is_err() || magic != header() {
+        return Err("unrecognized graphics job header".into());
+    }
+    let mut offset = HEADER as u64;
+    let mut entries = Vec::new();
+    let mut payload = Vec::new();
+    while offset < size {
+        let damaged = || format!("damaged graphics job at byte {offset}");
+        let mut frame = [0; 8];
+        if size - offset < 8 { return Err(damaged()); }
+        reader.read_exact(&mut frame).map_err(|_| damaged())?;
+        let len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+        if len as u64 > size - offset - 8 { return Err(damaged()); }
+        payload.resize(len, 0);
+        reader.read_exact(&mut payload).map_err(|_| damaged())?;
+        if check(&payload) != u32::from_le_bytes(frame[4..].try_into().unwrap()) { return Err(damaged()); }
+        let entry = decode(&payload).ok_or_else(|| format!("invalid graphics job entry {}", entries.len() + 1))?;
+        entries.push(take(&payload, entry));
+        offset += 8 + len as u64;
+    }
+    Ok(entries)
 }
 
 pub(crate) fn read_complete_payloads(path: &Path) -> Result<Vec<Vec<u8>>, String> {

@@ -87,6 +87,7 @@ class Staging(unittest.TestCase):
             [self.src, frame("G", overflow)], [self.src, good, frame("G", graphic(self.key), 4)],
             [self.src[:-1] + b"X", good], [self.src, good[:-1] + b"X"],
             [self.src, frame("C", compute(self.key, 2))],
+            [self.src, frame("C", compute(self.key, 0), 133)],
             [self.src, frame("M", struct.pack("<IQII", 25, self.key, 12, 12))],
             [self.src, frame("M", struct.pack("<IQI", 25, self.key, 11) + bytes(52)
                              + struct.pack("<I", 21) + bytes(56))],

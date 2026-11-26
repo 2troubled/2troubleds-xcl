@@ -958,6 +958,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if opts.prepare_corpus {
+        if opts.windows.is_some() || opts.split.is_some() || opts.limit != usize::MAX || opts.only.is_some() || opts.used_only {
+            eprintln!("xcl shaders: --prepare-corpus requires all staged recipes and their recorded memory configuration");
+            return 2;
+        }
         let progress = LaunchPreparation { adapter: "auto".into(), ..Default::default() };
         let result = pso_corpus::discover(path)
             .and_then(|c| c.ok_or_else(|| "No pipeline corpus found in this title folder".to_string()))
