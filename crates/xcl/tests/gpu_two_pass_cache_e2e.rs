@@ -5,6 +5,7 @@ mod shader_container;
 
 use shader_container::{container, dxil_part, fssm, le32, mesh_psv};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -429,7 +430,19 @@ fn mesh_ready(dev: &ID3D12Device) -> bool {
         && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0
 }
 
+fn blob_support(pso: &ID3D12PipelineState) -> (bool, bool) {
+    let raw = pso_async::resolve_wait(pso.as_raw() as usize);
+    let passes = real::two_pass_of(raw).expect("two-pass pipeline entry");
+    let available = |raw: usize| unsafe {
+        let raw = raw as *mut std::ffi::c_void;
+        let pso = ID3D12PipelineState::from_raw_borrowed(&raw).unwrap();
+        pso.GetCachedBlob().is_ok_and(|blob| blob.GetBufferSize() != 0 && !blob.GetBufferPointer().is_null())
+    };
+    (available(raw), available(passes.compute))
+}
+
 const CHILD_CASE: &str = "XCL_TEST_TWO_PASS_CACHE_CASE";
+const REPLAY_SKIP: &str = "SKIPPED two_pass_driver_cache_replay: driver could not export every fixture PSO";
 const TEST: &str = "two_pass_driver_cache_reuses_both_passes_and_recovers_corrupt_blobs";
 
 #[test]
@@ -459,16 +472,22 @@ fn two_pass_driver_cache_reuses_both_passes_and_recovers_corrupt_blobs() {
         assert!(out.status.success(), "{case}: {}
 {stderr}", String::from_utf8_lossy(&out.stdout));
         let prefix = format!("SKIPPED {TEST}: ");
-        stderr.lines().find_map(|line| line.strip_prefix(&prefix)).map(str::to_owned)
+        let hardware_skip = stderr.lines().find_map(|line| line.strip_prefix(&prefix)).map(str::to_owned);
+        (hardware_skip, stderr.lines().any(|line| line == REPLAY_SKIP))
     };
 
-    if let Some(reason) = run("disabled", false) {
+    if let (Some(reason), _) = run("disabled", false) {
         return runner::skip_test(&reason);
     }
     let driver = root.0.join("driver");
     assert!(!driver.exists(), "disabled cache must not create the driver directory");
-    assert_eq!(run("seed", true), None);
-    assert_eq!(run("warm", true), None);
+    let (hardware_skip, replay_skip) = run("seed", true);
+    assert_eq!(hardware_skip, None);
+    if replay_skip {
+        let _ = writeln!(std::io::stderr(), "{REPLAY_SKIP}");
+        return;
+    }
+    assert_eq!(run("warm", true), (None, false));
     let files: Vec<_> = fs::read_dir(&driver).unwrap().map(|e| e.unwrap().path()).collect();
     let (mesh, compute): (Vec<_>, Vec<_>) = files.into_iter()
         .filter(|path| path.extension().is_some_and(|ext| ext == "pso"))
@@ -479,13 +498,13 @@ fn two_pass_driver_cache_reuses_both_passes_and_recovers_corrupt_blobs() {
         for path in paths {
             fs::write(path, rejected).unwrap();
         }
-        assert_eq!(run("disabled", false), None);
+        assert_eq!(run("disabled", false), (None, false));
         for path in paths {
             assert_eq!(fs::read(path).unwrap(), rejected);
         }
-        assert_eq!(run(case, true), None);
+        assert_eq!(run(case, true), (None, false));
     }
-    assert_eq!(run("warm", true), None);
+    assert_eq!(run("warm", true), (None, false));
 }
 
 fn run_case(case: &str) {
@@ -515,25 +534,43 @@ float4 main(V v) : SV_Target0 { return v.p0; }
     let (errors, corrupt) = info_queue_errors(&dev);
     let expected = match case {
         "disabled" => [(0, 0, 0); 3],
-        "seed" => [(0, 0, 2), (0, 0, 3), (0, 0, 5)],
+        "seed" => [(0, 0, 0); 3],
         "warm" => [(2, 0, 0), (3, 0, 0), (5, 0, 0)],
         "stale-compute" => [(1, 1, 1), (1, 2, 2), (2, 3, 3)],
         "stale-mesh" => [(1, 1, 1), (2, 1, 1), (3, 2, 2)],
         _ => panic!("unknown case {case}"),
     };
 
+    let mut stores = 0;
+    let mut shared_mesh_exported = false;
+    let mut verify_cache = |pso: &ID3D12PipelineState, index: usize| {
+        if case == "seed" {
+            // Test the native interface independently of XCL's storage path. An older driver
+            // can build both passes while refusing to export one or both driver blobs.
+            let (mesh, compute) = blob_support(pso);
+            if mesh && (index == 2 || !shared_mesh_exported) {
+                stores += 1;
+                shared_mesh_exported = true;
+            }
+            stores += u64::from(compute);
+            assert_eq!(real::driver_cache_stats(), (0, 0, stores));
+        } else {
+            assert_eq!(real::driver_cache_stats(), expected[index]);
+        }
+    };
+
     let ms1 = build_ms_pso(&dev, &rs, &synthetic_ms_container(false), &ps);
-    assert_eq!(real::driver_cache_stats(), expected[0]);
+    verify_cache(&ms1, 0);
     assert_eq!(draw_two_pass_and_read(&dev, &ms1, 0, false), [0.25; 4]);
     assert_eq!(draw_two_pass_and_read(&dev, &ms1, 0, true), [1.0, 0.0, 0.0, 1.0]);
 
     // The second MS shares the passthrough mesh graphics PSO but has a distinct NGG compute PSO.
     let ms2 = build_ms_pso(&dev, &rs, &synthetic_ms_container(true), &ps);
-    assert_eq!(real::driver_cache_stats(), expected[1]);
+    verify_cache(&ms2, 1);
     assert_eq!(draw_two_pass_and_read(&dev, &ms2, 0, true), [0.5, 0.0, 0.0, 1.0]);
 
     let gs = build_gs_pso(&dev, &rs, &vs, &gs, &ps);
-    assert_eq!(real::driver_cache_stats(), expected[2]);
+    verify_cache(&gs, 2);
     assert_eq!(draw_two_pass_and_read(&dev, &gs, 1, false), [0.25; 4]);
     assert_eq!(draw_two_pass_and_read(&dev, &gs, 1, true), [0.0, 1.0, 0.0, 1.0]);
     assert_eq!(real::two_pass_count(), before + 3);
@@ -544,5 +581,8 @@ float4 main(V v) : SV_Target0 { return v.p0; }
         let (after_errors, after_corrupt) = info_queue_errors(&dev);
         assert_eq!(after_errors, errors, "unexpected D3D12 debug message in {case}");
         assert_eq!(after_corrupt - corrupt, expected[2].1, "unexpected corrupt-blob error count in {case}");
+    }
+    if case == "seed" && stores != 5 {
+        eprintln!("{REPLAY_SKIP}");
     }
 }

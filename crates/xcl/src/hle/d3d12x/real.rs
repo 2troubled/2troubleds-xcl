@@ -4801,22 +4801,23 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     if pso.is_null() {
         return None;
     }
-    let raw = if is_adopted(pso) {
+    let blob = if is_adopted(pso) {
         type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
         let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
         let mut out = std::ptr::null_mut();
         if get(pso, &mut out) < 0 || out.is_null() {
             return None;
         }
-        out
+        ID3DBlob::from_raw(out)
     } else {
-        let p = ID3D12PipelineState::from_raw_borrowed(&pso)?;
-        let blob = p.GetCachedBlob().ok()?;
-        return Some(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec());
+        ID3D12PipelineState::from_raw_borrowed(&pso)?.GetCachedBlob().ok()?
     };
-    let blob = ID3DBlob::from_raw(raw);
-    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
-    (!bytes.is_empty()).then_some(bytes)
+    let size = blob.GetBufferSize();
+    let data = blob.GetBufferPointer().cast::<u8>();
+    if size == 0 || data.is_null() {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(data, size).to_vec())
 }
 
 /// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
@@ -8428,6 +8429,41 @@ mod map_tests {
 #[cfg(test)]
 mod mesh_stream_tests {
     use super::*;
+
+    #[test]
+    fn driver_blob_export_failure_is_a_cache_miss() {
+        unsafe extern "system" fn no_blob(_: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+            *out = std::ptr::null_mut();
+            0x8000_FFFFu32 as HRESULT // E_UNEXPECTED
+        }
+
+        let iface = layout::find("ID3D12PipelineState").unwrap();
+        let mut pc = vec![0usize; iface.methods.len()];
+        pc[layout::slot(iface, "GetCachedBlob").unwrap()] = no_blob as *const () as usize;
+        let mut fake = [pc.as_ptr() as usize];
+        assert!(unsafe { read_pso_cached_blob(fake.as_mut_ptr().cast()) }.is_none());
+    }
+
+    #[test]
+    fn empty_driver_blob_is_a_cache_miss() {
+        unsafe extern "system" fn get_blob(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+            *out = *this.cast::<*mut c_void>().add(1);
+            S_OK
+        }
+        unsafe extern "system" fn release(_: *mut c_void) -> u32 { 0 }
+        unsafe extern "system" fn pointer(_: *mut c_void) -> *mut c_void {
+            std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+        }
+        unsafe extern "system" fn size(_: *mut c_void) -> usize { 0 }
+
+        let blob_vtable = [0, 0, release as *const () as usize, pointer as *const () as usize, size as *const () as usize];
+        let mut blob = [blob_vtable.as_ptr() as usize];
+        let iface = layout::find("ID3D12PipelineState").unwrap();
+        let mut pc = vec![0usize; iface.methods.len()];
+        pc[layout::slot(iface, "GetCachedBlob").unwrap()] = get_blob as *const () as usize;
+        let mut fake = [pc.as_ptr() as usize, blob.as_mut_ptr() as usize];
+        assert!(unsafe { read_pso_cached_blob(fake.as_mut_ptr().cast()) }.is_none());
+    }
 
     #[test]
     fn own_stream_rejects_null_truncated_and_unreadable_streams() {
