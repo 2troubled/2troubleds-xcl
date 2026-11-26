@@ -156,6 +156,10 @@ fn run_graphics(path: &Path, count: usize, windows: u32, parallel: usize, progre
                     made = made.max(n);
                     if let Err(e) = progress.complete_corpus(made) { break Err(e); }
                 } else {
+                    if let Some(verified) = line.strip_prefix("previously verified native graphics recipes: ")
+                        .and_then(|n| n.parse::<usize>().ok()) {
+                        eprintln!("Reused {verified} verified native graphics recipes");
+                    }
                     if let Some(values) = graphics_summary(&line) { summary = Some(values); }
                     if !line.trim().is_empty() { last = line; }
                 }

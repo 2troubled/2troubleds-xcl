@@ -18,20 +18,40 @@ mod warm_blobs;
 mod warm_pack;
 pub(crate) mod warm_replay;
 
-pub(crate) fn warm_settings_key() -> u64 {
-    let mut settings: Vec<_> = std::env::vars_os().filter(|(k,_)| {
-        let k = k.to_string_lossy();
-        k.starts_with("XCL_") && !matches!(k.as_ref(), "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
+pub(crate) fn warm_settings_key() -> u64 { warm_settings(std::env::vars_os()) }
+
+// Driver and cache directory are keyed separately. Worker PIDs, title paths, scheduling
+// and observation settings do not affect the recipe the driver validates.
+fn warm_settings(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> u64 {
+    let mut settings = Vec::new();
+    for (name, value) in vars {
+        let name = name.to_string_lossy().to_ascii_uppercase();
+        if !name.starts_with("XCL_") { continue; }
+        if matches!(name.as_str(),
+            "XCL_HOST" | "XCL_DATA_ROOT" | "XCL_ADAPTER" | "XCL_DXIL_CACHE" | "XCL_UMA_MB" |
+            "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
             "XCL_PRECOMPILE_SLICE" | "XCL_PRECOMPILE_COVERAGE_MAP" | "XCL_PRECOMPILE_COVERAGE_DIR" |
-            "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PREPARE" | "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" |
-            "XCL_PRESS_AT" | "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" |
-            "XCL_FRAME_DUMP" | "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS")
-    }).collect();
+            "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PREPARE" |
+            "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" | "XCL_PRESS_AT" |
+            "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" | "XCL_FRAME_DUMP" |
+            "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS") {
+            continue;
+        }
+        settings.push((name, value));
+    }
     settings.sort();
     warm_blobs::digest(&settings)
 }
 
-
+#[cfg(test)]
+#[test]
+fn warm_settings_ignore_worker_identity_but_keep_backend_changes() {
+    let key = |entries: &[(&str, &str)]| warm_settings(entries.iter().map(|(k, v)| ((*k).into(), (*v).into())));
+    let offline = key(&[("XCL_DIRECT_DXIL", "1")]);
+    let worker = key(&[("XCL_PRECOMPILE_PARENT", "812"), ("XCL_DXC_THREADS", "2"), ("xcl_direct_dxil", "1")]);
+    assert_eq!(offline, worker);
+    assert_ne!(offline, key(&[("xcl_direct_dxil", "all")]));
+}
 
 /// `--iface`: how console programs connect to their DXBC signatures (hypothesis checks for
 /// the VS/PS interface of the recompiler).
