@@ -59,6 +59,19 @@ pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
 }
 
 impl Corpus {
+    pub(super) fn graphics_path(&self) -> Option<&Path> {
+        self.graphics.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    pub(super) fn compute_path(&self, key: u64) -> Option<&Path> {
+        let i = self.compute.binary_search_by_key(&key, |(key, _)| *key).ok()?;
+        Some(self.compute[i].1.as_path())
+    }
+
+    pub(super) fn compute_directory(&self) -> Option<&Path> {
+        self.compute.first().and_then(|(_, path)| path.parent())
+    }
+
     pub(crate) fn prepare(&self, progress: &LaunchPreparation) -> Result<(), String> {
         self.prepare_with_threads(progress, None)
     }
@@ -180,6 +193,9 @@ mod tests {
         std::fs::write(dir.join("compute/0000000000000010.dxbc"), []).unwrap();
         let corpus = discover(&root).unwrap().unwrap();
         assert_eq!(corpus.compute[0].0, 16);
+        assert_eq!(corpus.compute_path(16), Some(dir.join("compute/0000000000000010.dxbc").as_path()));
+        assert!(corpus.compute_path(17).is_none());
+        assert!(corpus.graphics_path().is_none());
         assert_eq!(corpus.windows, 1);
         std::fs::write(dir.join("windows"), "255").unwrap();
         assert!(discover(&root).is_err());

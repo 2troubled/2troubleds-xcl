@@ -958,7 +958,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if opts.prepare_corpus {
-        if opts.windows.is_some() || opts.split.is_some() || opts.limit != usize::MAX || opts.only.is_some() || opts.used_only {
+        if opts.split.is_some() || opts.limit != usize::MAX || opts.only.is_some() || opts.used_only {
             eprintln!("xcl shaders: --prepare-corpus requires all staged recipes and their recorded memory configuration");
             return 2;
         }
@@ -1053,7 +1053,11 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
-        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, selected.as_ref(), opts.threads, t0, None) {
+        let coverage = match ComputeCoverage::worker() {
+            Ok(coverage) => coverage,
+            Err(e) => { eprintln!("xcl shaders: {e}"); return 2; }
+        };
+        return match precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, selected.as_ref(), opts.threads, t0, None, coverage.as_ref()) {
             Ok(()) => 0,
             Err(e) => { eprintln!("xcl shaders: {e}"); 2 }
         };
@@ -1884,7 +1888,7 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
     let corpus = pso_corpus::discover(root)?;
-    prepare_title_inputs(root, progress)?;
+    prepare_title_inputs(root, progress, corpus.as_ref())?;
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;
         progress.check_corpus_complete()?;
@@ -1892,7 +1896,7 @@ pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> R
     Ok(())
 }
 
-fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
+fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation, corpus: Option<&pso_corpus::Corpus>) -> Result<(), String> {
     let mut inputs = Vec::new();
     let pack = root.join("shaders.rpf");
     if pack.try_exists().map_err(|e| e.to_string())? {
@@ -1913,20 +1917,95 @@ fn prepare_title_inputs(root: &Path, progress: &LaunchPreparation) -> Result<(),
     if windows > 1 && recomp::pso::heap_windows() { windows |= recomp::HEAP_WINDOWS; }
     let workers = prepare_workers();
     for input in &inputs {
+        let coverage = corpus.filter(|c| c.compute_directory().is_some())
+            .map(|corpus| ComputeCoverage::Published(corpus, Mutex::default(), AtomicUsize::new(0)));
         if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
         // a pack: its stages here, its compute pipelines in worker processes (the driver builds
         // about two pipelines at a time for one process, whatever the processors)
         if workers > 1 && matches!(input, Input::Pack { .. }) {
             let n = input.len();
-            precompile(input, usize::MAX, windows, None, None, false, None, None, std::time::Instant::now(), Some(progress))?;
+            precompile(input, usize::MAX, windows, None, None, false, None, None, std::time::Instant::now(), Some(progress), coverage.as_ref())?;
             if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-            pipelines_in_workers(&pack, windows, workers, n, progress)?;
+            if coverage.as_ref().is_some_and(ComputeCoverage::all_staged) { continue; }
+            pipelines_in_workers(&pack, windows, workers, n, progress, coverage.as_ref())?;
             continue;
         }
-        precompile(input, usize::MAX, windows, None, None, true, None, None, std::time::Instant::now(), Some(progress))?;
+        precompile(input, usize::MAX, windows, None, None, true, None, None, std::time::Instant::now(), Some(progress), coverage.as_ref())?;
     }
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
-    graphics_in_workers(&inputs, windows, workers, progress)
+    graphics_in_workers(&inputs, windows, workers, progress, corpus.and_then(|c| c.graphics_path()))
+}
+
+/// Only records verified byte-for-byte against the discovered corpus may leave their native
+/// preparation to that pass. A worker also checks the index, key and bytes of its own pack.
+enum ComputeCoverage<'a> {
+    Published(&'a pso_corpus::Corpus, Mutex<BTreeMap<usize, u64>>, AtomicUsize),
+    Slice(PathBuf, BTreeMap<usize, u64>),
+}
+
+const COVERAGE_MAP: &str = "XCL_PRECOMPILE_COVERAGE_MAP";
+const COVERAGE_DIR: &str = "XCL_PRECOMPILE_COVERAGE_DIR";
+
+struct CoverageFile(PathBuf);
+impl Drop for CoverageFile {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+impl ComputeCoverage<'_> {
+    fn all_staged(&self) -> bool {
+        matches!(self, Self::Published(_, _, remaining) if remaining.load(Ordering::Relaxed) == 0)
+    }
+
+    fn covers(&self, index: usize, blob: &[u8]) -> Result<bool, String> {
+        let key = shader::fnv64(blob);
+        let path = match self {
+            Self::Published(corpus, _, remaining) => match corpus.compute_path(key) {
+                Some(path) => path.to_path_buf(),
+                None => { remaining.fetch_add(1, Ordering::Relaxed); return Ok(false); }
+            },
+            Self::Slice(dir, keys) if keys.get(&index) == Some(&key) => dir.join(format!("{key:016x}.dxbc")),
+            Self::Slice(..) => return Ok(false),
+        };
+        let staged = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if blob != staged {
+            if shader::fnv64(&staged) != key { return Err(format!("Staged compute shader {key:016x} changed")); }
+            if let Self::Published(_, _, remaining) = self { remaining.fetch_add(1, Ordering::Relaxed); }
+            return Ok(false);
+        }
+        if let Self::Published(_, selected, _) = self { selected.lock().unwrap().insert(index, key); }
+        Ok(true)
+    }
+
+    fn slice_file(&self) -> Result<Option<(CoverageFile, &Path)>, String> {
+        use std::io::Write;
+        let Self::Published(corpus, selected, _) = self else { return Ok(None) };
+        let Some(dir) = corpus.compute_directory() else { return Ok(None) };
+        let selected = selected.lock().unwrap();
+        if selected.is_empty() { return Ok(None); }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+        let path = std::env::temp_dir().join(format!("xcl-compute-coverage-{}-{nonce}.bin", std::process::id()));
+        let mut file = std::fs::File::create_new(&path).map_err(|e| e.to_string())?;
+        let cleanup = CoverageFile(path);
+        let mut bytes = Vec::with_capacity(selected.len()*16);
+        for (&i, &key) in selected.iter() { bytes.extend_from_slice(&(i as u64).to_le_bytes()); bytes.extend_from_slice(&key.to_le_bytes()); }
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        Ok(Some((cleanup, dir)))
+    }
+
+    fn worker() -> Result<Option<Self>, String> {
+        if std::env::var_os("XCL_PRECOMPILE_PARENT").is_none() { return Ok(None); }
+        let Some(path) = std::env::var_os(COVERAGE_MAP) else { return Ok(None) };
+        let dir = std::env::var_os(COVERAGE_DIR).ok_or("Missing staged compute directory for worker")?;
+        Self::read_slice(Path::new(&path), PathBuf::from(dir)).map(Some)
+    }
+
+    fn read_slice(path: &Path, dir: PathBuf) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        if bytes.len() % 16 != 0 { return Err("Incomplete compute worker coverage map".into()); }
+        let keys = bytes.chunks_exact(16).map(|b| (u64::from_le_bytes(b[..8].try_into().unwrap()) as usize,
+            u64::from_le_bytes(b[8..].try_into().unwrap()))).collect();
+        Ok(Self::Slice(dir, keys))
+    }
 }
 
 /// `XCL_PREPARE_WORKERS`: the processes that build a pack's compute pipelines before a title
@@ -2012,16 +2091,16 @@ mod claim_tests {
 }
 
 /// The compute pipelines of `pack` built by `workers` processes of this program, each on its own
-/// slice of the records (`XCL_PRECOMPILE_SLICE`): only the ones an earlier run of the title used
-/// when that list exists (the title builds another when it first uses it). Their records count
-/// into `progress`. A worker that fails is noted and the title starts all the same: it builds
-/// what is missing itself.
-fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation) -> Result<(), String> {
+/// slice of the records (`XCL_PRECOMPILE_SLICE`). A failed worker prevents guest entry.
+fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation,
+                        coverage: Option<&ComputeCoverage>) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let map = coverage.map(|c| c.slice_file()).transpose()?.flatten();
     let t0 = std::time::Instant::now();
     crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes");
     let (cancelled, failed, _) = in_workers(workers, records, progress, |i| {
         let mut c = worker_command(&me);
+        if let Some((file, dir)) = &map { c.env(COVERAGE_MAP, &file.0).env(COVERAGE_DIR, dir); }
         c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
         if std::env::var_os("XCL_ADAPTER").is_none() && !progress.adapter.is_empty() { c.env("XCL_ADAPTER", &progress.adapter); }
         c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
@@ -2039,7 +2118,7 @@ fn worker_command(me: &Path) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut c = std::process::Command::new(me);
-    for gone in ["XCL_HOST", "XCL_PREPARATION_PARENT", "XCL_PREPARATION_MENU", "XCL_RUN_SECONDS"] { c.env_remove(gone); }
+    for gone in ["XCL_HOST", "XCL_PREPARATION_PARENT", "XCL_PREPARATION_MENU", "XCL_RUN_SECONDS", COVERAGE_MAP, COVERAGE_DIR] { c.env_remove(gone); }
     c.env("XCL_PRECOMPILE_PARENT", std::process::id().to_string());
     if std::env::var_os("XCL_DXC_THREADS").is_none() { c.env("XCL_DXC_THREADS", "2"); }
     if std::env::var_os("XCL_PIPELINE_THREADS").is_none() { c.env("XCL_PIPELINE_THREADS", "1"); }
@@ -2116,9 +2195,8 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
 /// worker processes as the compute pipelines: the driver builds about two pipelines at a time for
 /// one process, and a driver that ends a worker ends no title. Their shaders come from the title's
 /// shader files (`inputs`) by key, as those of `used-shaders.txt`; each worker gets a file of its
-/// part (`gfx_records`' format, with the shaders it needs). A failure is noted and the title
-/// starts all the same: it builds what is missing itself.
-fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress: &LaunchPreparation) -> Result<(), String> {
+/// part (`gfx_records`' format, with the shaders it needs). A worker must confirm every recipe.
+fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress: &LaunchPreparation, staged_graphics: Option<&Path>) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let path = gfx_records::path();
     let local = if path.try_exists().map_err(|e| e.to_string())? { gfx_records::read_complete_payloads(&path)? } else { Vec::new() };
@@ -2135,7 +2213,7 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
             entry => if let Some(record) = GraphicsHistoryRecord::from_entry(entry) { records.push((payload, record)); },
         }
     }
-    let local_count = records.len();
+    let mut local_count = records.len();
     let legacy = gfx_records::shared_history_path();
     if !inputs.is_empty() && legacy != path {
         let scoped: HashSet<_> = records.iter().map(|(bytes, _)| bytes.as_slice()).collect();
@@ -2147,9 +2225,17 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
         crate::xlog_info!("Shader preparation: no graphics pipelines of an earlier run to build");
         return Ok(());
     }
-    let wanted = records.iter().flat_map(|(_, record)| record.identity().1.iter().copied())
+    if let Some(staged) = staged_graphics {
+        let before = records.len();
+        local_count = merge_staged_history(staged, &mut records, local_count, &mut embedded)?;
+        if before != records.len() {
+            crate::xlog_info!("Shader preparation: the mandatory staged job covers {} exact graphics history recipes", before - records.len());
+        }
+        if records.is_empty() { return Ok(()); }
+    }
+    let wanted: HashSet<_> = records.iter().flat_map(|(_, record)| record.identity().1.iter().copied())
         .filter(|&key| key != 0 && !embedded.contains_key(&key)).collect();
-    let mut shaders = shaders_by_key(inputs, wanted, progress);
+    let mut shaders = if wanted.is_empty() { HashMap::new() } else { shaders_by_key(inputs, wanted, progress) };
     shaders.extend(embedded);
     if progress.cancel.load(Ordering::Relaxed) { return Err("Shader preparation cancelled".into()); }
     let (buildable, missing) = buildable(records.iter().map(|(_, r)| r), &shaders);
@@ -2200,6 +2286,33 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
         t0.elapsed().as_secs_f64(), sum[0], sum[1], sum[2], sum[3]
     );
     Ok(())
+}
+
+/// Only identical serialized descriptors can be left for the subsequent mandatory staged job.
+fn merge_staged_history(
+    staged: &Path, records: &mut Vec<(Vec<u8>, GraphicsHistoryRecord)>, local_count: usize,
+    embedded: &mut HashMap<u64, Vec<u8>>,
+) -> Result<usize, String> {
+    let mut covered: HashMap<&[u8], bool> = records.iter().map(|(p, _)| (p.as_slice(), false)).collect();
+    let wanted: HashSet<u64> = records.iter().flat_map(|(_, r)| r.identity().1.iter().copied()).filter(|k| *k != 0).collect();
+    gfx_records::visit_payloads(staged, |payload| {
+        if let Some((key, code)) = gfx_records::shader_payload(payload) {
+            if wanted.contains(&key) {
+                if crate::hle::d3d12x::real::shader_key(code) != key || embedded.get(&key).is_some_and(|prior| prior.as_slice() != code) {
+                    return Err(format!("Staged graphics shader {key:016x} failed its identity check"));
+                }
+                embedded.entry(key).or_insert_with(|| code.to_vec());
+            }
+        } else if let Some(present) = covered.get_mut(payload) {
+            *present = true;
+        }
+        Ok(())
+    })?;
+    let keep: Vec<bool> = records.iter().map(|(p, _)| !covered[p.as_slice()]).collect();
+    let remaining_local = keep[..local_count].iter().filter(|&&k| k).count();
+    let mut keep = keep.into_iter();
+    records.retain(|_| keep.next().unwrap());
+    Ok(remaining_local)
 }
 
 /// The bytes of the shaders `wanted` (`real::shader_key`) in the title's shader files, looked
@@ -2369,7 +2482,7 @@ fn end_with_parent() {
     });
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, selected: Option<&std::collections::HashSet<u64>>, pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>) -> Result<(), String> {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, selected: Option<&std::collections::HashSet<u64>>, pipeline_threads: Option<usize>, t0: std::time::Instant, startup: Option<&LaunchPreparation>, coverage: Option<&ComputeCoverage>) -> Result<(), String> {
     if startup.is_none() { end_with_parent(); }
     let mandatory = startup.is_some() || std::env::var_os("XCL_PRECOMPILE_PARENT").is_some();
     let pipelines = if pipelines {
@@ -2470,6 +2583,19 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    if let Some(coverage) = coverage {
+                        match coverage.covers(i, &blob) {
+                            Ok(true) => { record_done(); continue; }
+                            Err(e) => {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                                let mut logs = errors.lock().unwrap();
+                                if logs.len() < 10 { logs.push(format!("{name}: {e}")); }
+                                record_done();
+                                continue;
+                            }
+                            Ok(false) => {}
+                        }
+                    }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
@@ -2562,6 +2688,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     }
     let failed = failed.into_inner();
     let skipped_reason = if startup.is_some() { "runtime pairing or unsupported translation" } else { "GS – paired at pipeline creation" };
+    if let Some(ComputeCoverage::Published(_, selected, _)) = coverage {
+        let count = selected.lock().unwrap().len();
+        if count != 0 { crate::xlog_info!("Shader preparation: {count} byte-matched compute records will be built by the staged corpus"); }
+    }
     println!(
         "compiled {}, already cached {}, errors {}, skipped ({skipped_reason}) {}, time {:.1} s",
         compiled.into_inner(),
@@ -2998,6 +3128,40 @@ mod tests {
     }
 
     #[test]
+    fn staged_history_defers_exact_recipes_and_supplies_sources_for_other_variants() {
+        use crate::hle::d3d12x::real::shader_key;
+        use windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        let path = std::env::temp_dir().join(format!("xcl-staged-history-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let code = b"vertex source";
+        let key = shader_key(code);
+        let pipeline = |mask| {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC { SampleMask: mask, ..Default::default() };
+            let payload = unsafe { gfx_records::encode(key, [key, 0, 0, 0, 0], &desc) };
+            let record = GraphicsHistoryRecord::from_entry(gfx_records::decode(&payload).unwrap()).unwrap();
+            (payload, record)
+        };
+        let mut records = vec![pipeline(1), pipeline(2), pipeline(1), pipeline(3)];
+        {
+            let mut staged = gfx_records::Writer::open(&path, u64::MAX).unwrap();
+            staged.add(&records[0].0).unwrap();
+            staged.add(&gfx_records::shader_entry(key, code)).unwrap();
+        }
+        let mut sources = HashMap::new();
+        assert_eq!(merge_staged_history(&path, &mut records, 2, &mut sources).unwrap(), 1);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, pipeline(2).0);
+        assert_eq!(records[1].0, pipeline(3).0);
+        assert_eq!(buildable(records.iter().map(|(_, r)| r), &sources), (vec![0, 1], 0));
+        {
+            let mut staged = gfx_records::Writer::open(&path, u64::MAX).unwrap();
+            staged.add(&gfx_records::shader_entry(key, b"wrong")).unwrap();
+        }
+        assert!(merge_staged_history(&path, &mut records, 1, &mut sources).unwrap_err().contains("identity check"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn a_graphics_job_with_a_missing_or_incorrectly_named_shader_fails() {
         use crate::hle::d3d12x::gfx_records::{encode_mesh, shader_entry, Writer};
         use crate::hle::d3d12x::real::shader_key;
@@ -3051,6 +3215,37 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    #[test]
+    fn staged_compute_covers_only_its_exact_sources_in_loose_and_pack_passes() {
+        let name = format!("xcl-compute-membership-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let root = std::env::temp_dir().join(name);
+        let base = root.join(".xcl/pso-corpus");
+        let dir = base.join("compute");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob = compute_sample();
+        let file = dir.join(format!("{:016x}.dxbc", shader::fnv64(&blob)));
+        std::fs::write(&file, &blob).unwrap();
+        std::fs::write(base.join("windows"), "4").unwrap();
+        std::fs::write(base.join("complete"), "0 1").unwrap();
+        let corpus = pso_corpus::discover(&root).unwrap().unwrap();
+        let parent = ComputeCoverage::Published(&corpus, Mutex::default(), AtomicUsize::new(0));
+        assert!(parent.covers(3, &blob).unwrap());
+        assert!(parent.all_staged(), "no compute slice workers needed");
+        assert!(!parent.covers(6, b"different source").unwrap());
+        assert!(!parent.all_staged(), "uncovered compute records still need the slice");
+        let (map, directory) = parent.slice_file().unwrap().unwrap();
+        let child = ComputeCoverage::read_slice(&map.0, directory.to_owned()).unwrap();
+        assert!(child.covers(3, &blob).unwrap());
+        assert!(!child.covers(7, &blob).unwrap(), "index absent from the checked pack");
+        assert!(!child.covers(3, b"changed input").unwrap(), "parent and child pack differ");
+        std::fs::write(&file, b"changed after discovery").unwrap();
+        assert!(child.covers(3, &blob).is_err(), "corrupt staged data cannot satisfy a recipe");
+        std::fs::remove_file(&file).unwrap();
+        assert!(parent.covers(3, &blob).is_err(), "missing staged data cannot satisfy a recipe");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -278,6 +278,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   ```
 
   The offline command accepts up to 32 workers. Normal launch also prepares the staged corpus.
+  When a shader pack or local history overlaps the corpus, XCL prepares each exact match once.
   Use the same adapter and memory-window
   configuration for offline preparation and play so the driver can reuse the results.
   Graphics state combinations absent from the supplied recipes and local history can still

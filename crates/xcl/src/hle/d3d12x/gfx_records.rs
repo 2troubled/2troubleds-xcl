@@ -484,7 +484,7 @@ pub(crate) fn read(path: &Path) -> Vec<Vec<u8>> {
 
 /// A completed worker job must contain only whole, supported records. A history file
 /// may be open for appends, so its reader above accepts a trailing partial entry.
-fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Result<Vec<T>, String> {
+pub(crate) fn visit_payloads(path: &Path, mut visit: impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
     use std::io::{BufReader, Read};
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
@@ -494,7 +494,6 @@ fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Res
         return Err("unrecognized graphics job header".into());
     }
     let mut offset = HEADER as u64;
-    let mut entries = Vec::new();
     let mut payload = Vec::new();
     while offset < size {
         let damaged = || format!("damaged graphics job at byte {offset}");
@@ -506,10 +505,26 @@ fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Res
         payload.resize(len, 0);
         reader.read_exact(&mut payload).map_err(|_| damaged())?;
         if check(&payload) != u32::from_le_bytes(frame[4..].try_into().unwrap()) { return Err(damaged()); }
-        let entry = decode(&payload).ok_or_else(|| format!("invalid graphics job entry {}", entries.len() + 1))?;
-        entries.push(take(&payload, entry));
+        visit(&payload)?;
         offset += 8 + len as u64;
     }
+    Ok(())
+}
+
+pub(crate) fn shader_payload(payload: &[u8]) -> Option<(u64, &[u8])> {
+    let (&tag, rest) = payload.split_first()?;
+    if tag != SHADER { return None; }
+    let mut r = Reader(rest);
+    Some((r.u64()?, r.0))
+}
+
+fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Result<Vec<T>, String> {
+    let mut entries = Vec::new();
+    visit_payloads(path, |bytes| {
+        let entry = decode(bytes).ok_or_else(|| format!("invalid graphics job entry {}", entries.len() + 1))?;
+        entries.push(take(bytes, entry));
+        Ok(())
+    })?;
     Ok(entries)
 }
 
@@ -607,7 +622,7 @@ pub(crate) fn note(payload: Vec<u8>) {
             let mut w = match Writer::open(&path, cap) {
                 Ok(w) => w,
                 Err(e) => {
-                    crate::xlog_warn!("D3D12.X: {}: {e} – the graphics pipelines of this run are not prepared before the next", path.display());
+                    crate::xlog_warn!("D3D12.X: {}: {e} â€“ the graphics pipelines of this run are not prepared before the next", path.display());
                     return;
                 }
             };
@@ -622,7 +637,7 @@ pub(crate) fn note(payload: Vec<u8>) {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        crate::xlog_warn!("D3D12.X: {}: {e} – no more graphics pipelines are recorded in this run", path.display());
+                        crate::xlog_warn!("D3D12.X: {}: {e} â€“ no more graphics pipelines are recorded in this run", path.display());
                         return;
                     }
                 }
