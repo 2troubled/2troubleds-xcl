@@ -2199,7 +2199,7 @@ fn in_workers(workers: usize, records: usize, progress: &LaunchPreparation, mut 
 fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress: &LaunchPreparation, staged_graphics: Option<&Path>) -> Result<(), String> {
     let t0 = std::time::Instant::now();
     let path = gfx_records::path();
-    let local = if path.try_exists().map_err(|e| e.to_string())? { gfx_records::read_complete_payloads(&path)? } else { Vec::new() };
+    let local = if path.try_exists().map_err(|e| e.to_string())? { gfx_records::read_history_payloads(&path)? } else { Vec::new() };
     let mut records = Vec::new();
     let mut embedded = std::collections::HashMap::new();
     for payload in local {
@@ -2241,9 +2241,10 @@ fn graphics_in_workers(inputs: &[Input], windows: u32, workers: usize, progress:
     let (buildable, missing) = buildable(records.iter().map(|(_, r)| r), &shaders);
     let local_missing = local_count - buildable.iter().take_while(|&&i| i < local_count).count();
     if local_missing != 0 {
-        return Err(format!("{local_missing} of {local_count} title graphics recipes lack matching shader sources"));
+        crate::xlog_info!("Shader preparation: deferring {local_missing} of {local_count} recorded title graphics recipes until their shader sources are available");
     }
-    if missing != 0 { crate::xlog_info!("Shader preparation: {missing} shared graphics recipes have no matching shaders in this title"); }
+    let shared_missing = missing - local_missing;
+    if shared_missing != 0 { crate::xlog_info!("Shader preparation: {shared_missing} shared graphics recipes have no matching shaders in this title"); }
     if buildable.is_empty() { return Ok(()); }
     let workers = workers.clamp(1, buildable.len());
     // each worker's part, with the shaders it needs (removed when they are done)

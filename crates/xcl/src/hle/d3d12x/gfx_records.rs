@@ -482,9 +482,9 @@ pub(crate) fn read(path: &Path) -> Vec<Vec<u8>> {
     payloads(&file).map_or_else(Vec::new, |(list, _)| list.into_iter().map(<[u8]>::to_vec).collect())
 }
 
-/// A completed worker job must contain only whole, supported records. A history file
-/// may be open for appends, so its reader above accepts a trailing partial entry.
-pub(crate) fn visit_payloads(path: &Path, mut visit: impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
+/// A completed worker job must contain only whole, supported records. A title history
+/// may end inside an append after the previous run stopped.
+fn visit_payloads_with_tail(path: &Path, allow_incomplete_tail: bool, mut visit: impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
     use std::io::{BufReader, Read};
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
@@ -498,10 +498,16 @@ pub(crate) fn visit_payloads(path: &Path, mut visit: impl FnMut(&[u8]) -> Result
     while offset < size {
         let damaged = || format!("damaged graphics job at byte {offset}");
         let mut frame = [0; 8];
-        if size - offset < 8 { return Err(damaged()); }
+        if size - offset < 8 {
+            if allow_incomplete_tail { break; }
+            return Err(damaged());
+        }
         reader.read_exact(&mut frame).map_err(|_| damaged())?;
         let len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
-        if len as u64 > size - offset - 8 { return Err(damaged()); }
+        if len as u64 > size - offset - 8 {
+            if allow_incomplete_tail { break; }
+            return Err(damaged());
+        }
         payload.resize(len, 0);
         reader.read_exact(&mut payload).map_err(|_| damaged())?;
         if check(&payload) != u32::from_le_bytes(frame[4..].try_into().unwrap()) { return Err(damaged()); }
@@ -511,6 +517,10 @@ pub(crate) fn visit_payloads(path: &Path, mut visit: impl FnMut(&[u8]) -> Result
     Ok(())
 }
 
+pub(crate) fn visit_payloads(path: &Path, visit: impl FnMut(&[u8]) -> Result<(), String>) -> Result<(), String> {
+    visit_payloads_with_tail(path, false, visit)
+}
+
 pub(crate) fn shader_payload(payload: &[u8]) -> Option<(u64, &[u8])> {
     let (&tag, rest) = payload.split_first()?;
     if tag != SHADER { return None; }
@@ -518,9 +528,13 @@ pub(crate) fn shader_payload(payload: &[u8]) -> Option<(u64, &[u8])> {
     Some((r.u64()?, r.0))
 }
 
-fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Result<Vec<T>, String> {
+fn read_complete<T>(path: &Path, allow_incomplete_tail: bool, mut take: impl FnMut(&[u8], Entry) -> T) -> Result<Vec<T>, String> {
     let mut entries = Vec::new();
-    visit_payloads(path, |bytes| {
+    visit_payloads_with_tail(path, allow_incomplete_tail, |bytes| {
+        // A newer recorder can add a tag without changing the frame format.
+        if allow_incomplete_tail && bytes.first().is_some_and(|tag| !matches!(*tag, PIPELINE | SHADER | MESH_PIPELINE | DEPTH_BOUNDS_PIPELINE)) {
+            return Ok(());
+        }
         let entry = decode(bytes).ok_or_else(|| format!("invalid graphics job entry {}", entries.len() + 1))?;
         entries.push(take(bytes, entry));
         Ok(())
@@ -528,12 +542,12 @@ fn read_complete<T>(path: &Path, mut take: impl FnMut(&[u8], Entry) -> T) -> Res
     Ok(entries)
 }
 
-pub(crate) fn read_complete_payloads(path: &Path) -> Result<Vec<Vec<u8>>, String> {
-    read_complete(path, |bytes, _| bytes.to_vec())
+pub(crate) fn read_history_payloads(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    read_complete(path, true, |bytes, _| bytes.to_vec())
 }
 
 pub(crate) fn read_job(path: &Path) -> Result<Vec<Entry>, String> {
-    read_complete(path, |_, entry| entry)
+    read_complete(path, false, |_, entry| entry)
 }
 
 /// What became of an entry handed to `Writer::add`.
@@ -884,6 +898,35 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         Writer::open(&path, u64::MAX).unwrap().add(&[0xff]).unwrap();
         assert!(read_job(&path).is_err());
+    }
+
+    #[test]
+    fn history_reader_keeps_verified_entries_after_an_incomplete_final_append() {
+        let dir = directory("history-tail");
+        let path = dir.0.join("history.bin");
+        let first = shader_entry(5, b"shader");
+        let mut writer = Writer::open(&path, u64::MAX).unwrap();
+        writer.add(&first).unwrap();
+        drop(writer);
+        let original = std::fs::read(&path).unwrap();
+        let mut writer = Writer::open(&path, u64::MAX).unwrap();
+        writer.add(&shader_entry(6, b"next")).unwrap();
+        drop(writer);
+        let complete = std::fs::read(&path).unwrap();
+        let second = &complete[original.len()..];
+        for tail in [&second[..3], &second[..second.len() - 2]] {
+            std::fs::write(&path, [original.as_slice(), tail].concat()).unwrap();
+            assert_eq!(read_history_payloads(&path).unwrap(), vec![first.clone()]);
+            assert!(read_job(&path).is_err(), "worker jobs still require whole frames");
+        }
+        let mut corrupt = original;
+        corrupt[HEADER + 8] ^= 1;
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(read_history_payloads(&path).is_err(), "a complete but corrupt frame is not a torn append");
+        std::fs::write(&path, &complete).unwrap();
+        Writer::open(&path, u64::MAX).unwrap().add(&[0xff]).unwrap();
+        assert_eq!(read_history_payloads(&path).unwrap(), vec![first, shader_entry(6, b"next")]);
+        assert!(read_job(&path).is_err(), "an unsupported worker entry remains an error");
     }
 
     #[test]
