@@ -54,6 +54,12 @@ class Staging(unittest.TestCase):
         self.assertEqual((self.dest / "compute" / f"{self.key:016x}.dxbc").read_bytes(), self.shader)
         self.assertEqual((self.dest / "windows").read_text().strip(), "132")
         self.assertEqual((self.dest / "complete").read_bytes(), b"3 1\n")
+        identity = (self.dest / "identity").read_text().strip()
+        self.assertEqual(len(identity), 64)
+        self.assertEqual(identity, stage.corpus_identity(self.dest))
+        original = identity
+        (self.dest / "compute" / f"{self.key:016x}.dxbc").write_bytes(b"changed")
+        self.assertNotEqual(original, stage.corpus_identity(self.dest))
         with (self.dest / "graphics.bin").open("rb") as f:
             self.assertEqual(f.read(12), stage.GFX_HEADER)
             entries = []
@@ -74,6 +80,7 @@ class Staging(unittest.TestCase):
     def test_compute_only_corpus_omits_graphics_job(self):
         stage.stage(self.title, [self.journal("compute", [self.src, frame("C", compute(self.key, 0))])])
         self.assertEqual((self.dest / "complete").read_bytes(), b"0 1\n")
+        self.assertEqual((self.dest / "identity").read_text().strip(), stage.corpus_identity(self.dest))
         self.assertFalse((self.dest / "graphics.bin").exists())
 
     def test_invalid_frames_never_publish(self):

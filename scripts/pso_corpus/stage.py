@@ -17,6 +17,7 @@ import tempfile
 OFFSET, PRIME, MASK = 0xcbf29ce484222325, 0x100000001b3, (1 << 64) - 1
 HEADER = struct.Struct("<cBHIQ")
 GFX_HEADER = b"XCLGFXP\0" + struct.pack("<I", 1)
+IDENTITY_SCHEMA = b"xcl-pso-corpus-v1\0"
 
 
 def require(condition, message):
@@ -28,6 +29,22 @@ def fnv(data, seed=OFFSET):
     for value in data:
         seed = ((seed ^ value) * PRIME) & MASK
     return seed
+
+
+def corpus_identity(dest):
+    """SHA-256 of the published corpus schema, paths and file contents."""
+    digest = hashlib.sha256(IDENTITY_SCHEMA)
+    for path in sorted(p for p in dest.rglob("*") if p.is_file() and p.name != "identity"):
+        relative = path.relative_to(dest).as_posix().encode("utf-8")
+        digest.update(struct.pack("<I", len(relative)))
+        digest.update(relative)
+        digest.update(struct.pack("<Q", path.stat().st_size))
+        contents = hashlib.sha256()
+        with path.open("rb") as source:
+            while block := source.read(1024 * 1024):
+                contents.update(block)
+        digest.update(contents.digest())
+    return digest.hexdigest()
 
 
 def shader_set(keys):
@@ -236,6 +253,7 @@ def build(journals, dest, spool, records):
             shutil.copyfileobj(records, out)
     (dest / "windows").write_bytes(f"{window}\n".encode("ascii"))
     (dest / "complete").write_bytes(f"{len(normalized)} {len(compute_sources)}\n".encode("ascii"))
+    (dest / "identity").write_bytes(f"{corpus_identity(dest)}\n".encode("ascii"))
     counts.update(graphics_mesh_records=len(normalized), graphics_sources=len(gfx_sources),
                   compute_files=len(compute_sources), compute_node_aliases=counts["C"]-len(compute_sources))
     return dict(counts)
