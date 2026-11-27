@@ -31,7 +31,21 @@ impl NativeLibrary {
 
     pub(crate) fn open(device: &ID3D12Device, serialized: Vec<u8>) -> Result<Self> {
         let device: ID3D12Device1 = device.cast()?;
-        let library = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(&serialized)? };
+        let library = if serialized.is_empty() {
+            let mut library = std::ptr::null_mut();
+            unsafe {
+                (Interface::vtable(&device).CreatePipelineLibrary)(
+                    Interface::as_raw(&device),
+                    std::ptr::null(),
+                    0,
+                    &ID3D12PipelineLibrary1::IID,
+                    &mut library,
+                ).ok()?;
+                ID3D12PipelineLibrary1::from_raw(library)
+            }
+        } else {
+            unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary1>(&serialized)? }
+        };
         Ok(Self { library, _serialized: serialized })
     }
 
