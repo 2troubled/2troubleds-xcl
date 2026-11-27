@@ -5358,6 +5358,14 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     } else if build.reused && from_disk {
         driver_cache::note(true, None);
     }
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(pso) = ID3D12PipelineState::from_raw_borrowed(&*ppv) {
+            if let Err(e) = crate::shaders::pipeline_library::store(driver_cache::graphics_name(gkey.0, gkey.1), pso) {
+                note_translation_error(e);
+                return Some(E_INVALIDARG);
+            }
+        }
+    }
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -6478,6 +6486,26 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     drop(slot);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
+        return E_INVALIDARG;
+    }
+    let library = crate::shaders::pipeline_library::store(
+        match gkey {
+            Some((hash, bytes)) => driver_cache::graphics_name(hash, bytes),
+            None if crate::shaders::pipeline_library::building() => {
+                super::pso_async::release(compute as usize);
+                return E_INVALIDARG;
+            }
+            None => String::new(),
+        },
+        &mesh_pso,
+    ).and_then(|_| {
+        let compute_pso = ID3D12PipelineState::from_raw_borrowed(&compute)
+            .ok_or_else(|| "The two-pass compute pipeline has no native object".to_string())?;
+        crate::shaders::pipeline_library::store(driver_cache::name(&tp.cs, 0), compute_pso)
+    });
+    if let Err(e) = library {
+        note_translation_error(e);
+        super::pso_async::release(compute as usize);
         return E_INVALIDARG;
     }
     let mesh_pso = mesh_pso.into_raw();
