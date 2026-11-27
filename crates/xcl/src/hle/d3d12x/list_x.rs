@@ -270,13 +270,36 @@ enum PendingWaitObservation {
 
 impl PendingWait {
     unsafe fn read_value(&self) -> Option<u64> {
-        let addr = self.va as usize;
-        if !crate::gpu::shader::readable(addr, self.width as usize) {
+        self.read_value_with_uma(crate::gpu::uma::get())
+    }
+
+    unsafe fn read_value_with_uma(&self, uma: Option<&crate::gpu::uma::Uma>) -> Option<u64> {
+        let width = self.width as usize;
+        if !matches!(width, 4 | 8) {
             return None;
         }
+        let va = self.va as usize;
+        if uma.is_some_and(|uma| uma.in_committed_window(va, width)) {
+            // The committed coherent UMA window cannot fault. Keep its hot polling path to one
+            // acquire load; ReadProcessMemory is reserved for addresses whose lifetime is not
+            // controlled by the runtime.
+            return Some(match self.width {
+                4 => (*(va as *const AtomicU32)).load(Ordering::Acquire) as u64,
+                8 => (*(va as *const AtomicU64)).load(Ordering::Acquire),
+                _ => unreachable!(),
+            });
+        }
+        let mut bytes = [0u8; 8];
+        if !crate::hle::dstorage::read_own(va, bytes.as_mut_ptr(), width) {
+            return None;
+        }
+        // `ReadProcessMemory` performs the possibly-faulting snapshot in the kernel, so a page
+        // decommitted concurrently returns failure instead of faulting this submission thread.
+        // Keep the title's writes before every host read that follows a successful snapshot.
+        std::sync::atomic::fence(Ordering::Acquire);
         match self.width {
-            4 => Some((*(addr as *const AtomicU32)).load(Ordering::Acquire) as u64),
-            8 => Some((*(addr as *const AtomicU64)).load(Ordering::Acquire)),
+            4 => Some(u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64),
+            8 => Some(u64::from_ne_bytes(bytes)),
             _ => None,
         }
     }
@@ -6634,6 +6657,25 @@ mod tests {
     }
 
     #[test]
+    fn committed_uma_wait_uses_coherent_atomic_observation() {
+        let uma = crate::gpu::uma::Uma::for_runtime(16 << 20).expect("runtime UMA");
+        let va = uma.alloc(0x1000, 8).expect("coherent wait cell") as usize;
+        unsafe {
+            (*(va as *const AtomicU64)).store(0x1234_5678_9abc_def0, Ordering::Release);
+            let wait = PendingWait {
+                va: va as u64,
+                width: 8,
+                comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
+                value: 0,
+                mask: u64::MAX,
+                after_write64: false,
+            };
+            assert_eq!(wait.read_value_with_uma(Some(&uma)), Some(0x1234_5678_9abc_def0));
+        }
+        assert!(uma.free(va));
+    }
+
+    #[test]
     fn an_unreadable_wait_cell_is_not_completion() {
         let wait = PendingWait {
             va: 0x10,
@@ -6652,6 +6694,39 @@ mod tests {
                 &[],
                 Duration::ZERO,
             ), "an unreadable CPU fallback must fail closed");
+        }
+    }
+
+    #[test]
+    fn a_decommitted_wait_cell_is_observed_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE,
+            PAGE_READWRITE,
+        };
+
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            );
+            assert!(!page.is_null());
+            let value = page.cast::<AtomicU64>();
+            (*value).store(7, Ordering::Release);
+            let wait = PendingWait {
+                va: value as u64,
+                width: 8,
+                comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32,
+                value: 7,
+                mask: u64::MAX,
+                after_write64: false,
+            };
+            assert_eq!(wait.observe(), PendingWaitObservation::Satisfied);
+
+            assert_ne!(VirtualFree(page, 0x1000, MEM_DECOMMIT), 0);
+            assert_eq!(wait.observe(), PendingWaitObservation::Unreadable);
+            assert_ne!(VirtualFree(page, 0, MEM_RELEASE), 0);
         }
     }
 
