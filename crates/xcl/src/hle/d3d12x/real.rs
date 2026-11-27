@@ -560,6 +560,7 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         }
         open_uma(&device, allow_driver_remap);
         super::device_x::probe_dynamic_depth_bias(&device);
+        crate::shaders::pipeline_library::activate(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -4416,7 +4417,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
         in_driver.as_millis(),
-        if reused { ", the driver's blob of an earlier build" } else { "" }
+        if reused { ", prepared native pipeline or driver's blob" } else { "" }
     );
     Some(Ok(hr))
 }
@@ -4440,6 +4441,13 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    let library_name = driver_cache::name_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    if !ppv.is_null() {
+        if let Some(pso) = crate::shaders::pipeline_library::load_compute(&library_name, &copy) {
+            *ppv = pso.into_raw();
+            return (S_OK, std::time::Duration::ZERO, true);
+        }
+    }
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
@@ -5317,13 +5325,26 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = depth_bounds_key(graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers), depth_bounds);
-    let mut cached = graphics_blob(gkey);
+    let library_name = driver_cache::graphics_name(gkey.0, gkey.1);
+    let library_pso = if ppv.is_null() {
+        None
+    } else if depth_bounds {
+        let stream = depth_bounds_stream(&copy);
+        let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: stream.0.len(), pPipelineStateSubobjectStream: stream.0.as_ptr() as _ };
+        crate::shaders::pipeline_library::load_stream(&library_name, &desc)
+    } else {
+        crate::shaders::pipeline_library::load_graphics(&library_name, &copy)
+    };
+    let mut cached = library_pso.is_none().then(|| graphics_blob(gkey)).flatten();
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
-    let from_disk = cached.is_none();
+    let from_disk = library_pso.is_none() && cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
-    let build = create_graphics_pso_cached(
+    let build = if let Some(pso) = library_pso {
+        *ppv = pso.into_raw();
+        GraphicsPsoBuild { hr: S_OK, in_driver: std::time::Duration::ZERO, reused: false, cache_eligible: false }
+    } else { create_graphics_pso_cached(
         &mut copy,
         cached.as_deref().map(Vec::as_slice),
         rect_gs.is_some(),
@@ -5342,7 +5363,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
             let create: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
             finish_pso(this, create, &desc as *const _ as _, riid, ppv)
         } else { finish_pso(this, f, c as *const _ as *const c_void, riid, ppv) },
-    );
+    ) };
     let hr = build.hr;
     if build.reused {
         if let Some(blob) = cached.as_ref() {
@@ -6353,8 +6374,13 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         two_pass_identity::two_pass_stream_key(&stream.0, ps_samplers, driver, crate::gpu::recomp::pso::mem_windows())
     });
     let gdisk = gkey.and_then(|(hash, bytes)| driver_cache::graphics_path(hash, bytes));
-    let gram = gkey.and_then(graphics_blob);
-    let gfrom_disk = gram.is_none();
+    let stream_desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: stream.0.len(), pPipelineStateSubobjectStream: stream.0.as_ptr() as *mut c_void };
+    let library_mesh = gkey.and_then(|(hash, bytes)| {
+        crate::shaders::pipeline_library::load_stream(&driver_cache::graphics_name(hash, bytes), &stream_desc)
+    });
+    let mesh_from_library = library_mesh.is_some();
+    let gram = if mesh_from_library { None } else { gkey.and_then(graphics_blob) };
+    let gfrom_disk = !mesh_from_library && gram.is_none();
     let gcached = gram.or_else(|| gdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new));
 
     let bytes = mesh_bytes + tp.cs.len();
@@ -6387,11 +6413,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         let pso = (!raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw));
         (hr, pso, took)
     };
-    if gcached.is_none() {
+    if gcached.is_none() && !mesh_from_library {
         take_cold_slot();
     }
-    let (mut hr, mut mesh_pso, mut gin_driver) = create_mesh(kind, gcached.as_deref().map(Vec::as_slice));
-    let mut greused = gcached.is_some();
+    let (mut hr, mut mesh_pso, mut gin_driver) = match library_mesh {
+        Some(pso) => (S_OK, Some(pso), std::time::Duration::ZERO),
+        None => create_mesh(kind, gcached.as_deref().map(Vec::as_slice)),
+    };
+    let mut greused = mesh_from_library || gcached.is_some();
     if let Some((key, blob)) = gkey.zip(gcached.as_ref()).filter(|_| hr < 0 || mesh_pso.is_none()) {
         drop(mesh_pso.take());
         if gfrom_disk || forget_graphics_blob(key, blob) {
@@ -6438,22 +6467,26 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
     // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
-    let mut ccached = compute_blob(ckey);
+    let library_compute = crate::shaders::pipeline_library::load_compute(&driver_cache::name(&tp.cs, 0), &cdesc);
+    let compute_from_library = library_compute.is_some();
+    let mut ccached = if compute_from_library { None } else { compute_blob(ckey) };
     let cdisk = driver_cache::path(&tp.cs, 0);
-    let cfrom_disk = ccached.is_none();
+    let cfrom_disk = !compute_from_library && ccached.is_none();
     if cfrom_disk {
         ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
-    } else {
+    } else if !compute_from_library {
         take_cold_slot();
     }
     let iid = pc_iid(Kind::PipelineState);
-    let mut compute: *mut c_void = std::ptr::null_mut();
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
+    let mut compute: *mut c_void = library_compute.map_or(std::ptr::null_mut(), |pso| pso.into_raw());
+    let (mut hc, mut cin_driver) = if compute_from_library {
+        (S_OK, std::time::Duration::ZERO)
+    } else { driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
-    });
+    }) };
     if hc < 0 && ccached.is_some() {
         forget_compute_blob(ckey);
         if cfrom_disk {
@@ -6468,7 +6501,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         hc = retried;
         cin_driver += took;
     }
-    let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+    let creused = compute_from_library || (hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0);
     if creused {
         if let Some(blob) = ccached.as_ref() {
             crate::shaders::warm_replay::accepted(cdisk.as_deref(), blob);
