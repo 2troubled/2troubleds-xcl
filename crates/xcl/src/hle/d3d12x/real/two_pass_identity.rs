@@ -221,9 +221,15 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
                 }
             }
             1..=6 | 24 | 25 => {
-                if matches!(ty, 1..=5) && payload.iter().all(|&byte| byte == 0) {
-                    h.u32(ty);
-                    h.u64(0);
+                let state = read_state::<D3D12_SHADER_BYTECODE>(payload)?;
+                if state.BytecodeLength == 0 {
+                    if ty == 25 {
+                        return None;
+                    }
+                    if matches!(ty, 1..=5) && payload.iter().all(|&byte| byte == 0) {
+                        h.u32(ty);
+                        h.u64(0);
+                    }
                     continue;
                 }
                 let code = payload_shader(payload)?;
