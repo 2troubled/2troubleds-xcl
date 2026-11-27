@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 use crate::hle::d3d12x::gfx_records;
 pub(crate) mod pso_corpus;
+mod pipeline_library;
 mod warm_blobs;
 mod warm_pack;
 pub(crate) mod warm_replay;
