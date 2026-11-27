@@ -16,11 +16,16 @@ pub(crate) fn read_receipt<T: serde::de::DeserializeOwned>(path: &Path) -> Optio
 }
 
 pub(crate) fn write_receipt<T: Serialize>(path: &Path, receipt: &T) -> bool {
+    let Some(bytes) = receipt_bytes(receipt) else { return false };
+    crate::hle::d3d12x::real::driver_cache::write(path, &bytes)
+}
+
+pub(crate) fn receipt_bytes<T: Serialize>(receipt: &T) -> Option<Vec<u8>> {
     let mut bytes = vec![0; 8];
-    if serde_json::to_writer(&mut bytes, receipt).is_err() { return false; }
+    if serde_json::to_writer(&mut bytes, receipt).is_err() { return None; }
     let checksum = crate::gpu::shader::fnv64(&bytes[8..]).to_le_bytes();
     bytes[..8].copy_from_slice(&checksum);
-    crate::hle::d3d12x::real::driver_cache::write(path, &bytes)
+    Some(bytes)
 }
 
 pub(crate) type Stamp = [u64; 3];

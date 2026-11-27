@@ -17,6 +17,7 @@ pub(crate) mod pso_corpus;
 pub(crate) mod pipeline_library;
 mod warm_blobs;
 mod warm_pack;
+mod warm_library;
 pub(crate) mod warm_replay;
 
 pub(crate) fn warm_settings_key() -> u64 { warm_settings(std::env::vars_os()) }
@@ -1951,6 +1952,16 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
     let corpus = pso_corpus::discover(root)?;
+    if let Some(corpus) = &corpus {
+        if warm_library::reuse(corpus, &progress.adapter) {
+            let (graphics, compute) = corpus.counts();
+            let total = graphics.checked_add(compute).ok_or("Pipeline corpus count overflow")?;
+            progress.begin_corpus(total);
+            progress.complete_corpus(total)?;
+            crate::xlog_info!("Pipeline preparation: reused the complete native pipeline libraries ({total} recipes)");
+            return Ok(());
+        }
+    }
     prepare_title_inputs(root, progress, corpus.as_ref())?;
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;

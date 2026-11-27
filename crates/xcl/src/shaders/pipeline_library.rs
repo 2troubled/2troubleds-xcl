@@ -45,7 +45,7 @@ pub(crate) fn finish(path: &std::path::Path) -> std::result::Result<usize, Strin
     Ok(count)
 }
 
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,7 +77,7 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 
 pub(crate) struct NativeLibrary {
     library: ID3D12PipelineLibrary1,
-    _serialized: Vec<u8>,
+    _serialized: std::sync::Arc<[u8]>,
 }
 
 impl NativeLibrary {
@@ -95,10 +95,14 @@ impl NativeLibrary {
     }
 
     pub(crate) fn empty(device: &ID3D12Device) -> Result<Self> {
-        Self::open(device, Vec::new())
+        Self::open_shared(device, std::sync::Arc::from([]))
     }
 
     pub(crate) fn open(device: &ID3D12Device, serialized: Vec<u8>) -> Result<Self> {
+        Self::open_shared(device, serialized.into())
+    }
+
+    pub(crate) fn open_shared(device: &ID3D12Device, serialized: std::sync::Arc<[u8]>) -> Result<Self> {
         let device: ID3D12Device1 = device.cast()?;
         let library = if serialized.is_empty() {
             let mut library = std::ptr::null_mut();

@@ -80,6 +80,18 @@ pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
 impl Corpus {
     pub(crate) fn identity(&self) -> Option<[u8; 32]> { self.identity }
 
+    pub(crate) fn directory(&self) -> &Path {
+        self.graphics.as_ref().map(|(path, _)| path.parent().unwrap())
+            .or_else(|| self.compute.first().and_then(|(_, path)| path.parent()?.parent()))
+            .expect("a published corpus is not empty")
+    }
+
+    pub(crate) fn windows(&self) -> u32 { self.windows }
+
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (self.graphics.as_ref().map_or(0, |(_, count)| *count), self.compute.len())
+    }
+
     pub(super) fn graphics_path(&self) -> Option<&Path> {
         self.graphics.as_ref().map(|(path, _)| path.as_path())
     }
@@ -110,7 +122,11 @@ impl Corpus {
         if let Some((path, n)) = &self.graphics {
             run_graphics(path, *n, count, parallel, progress)?;
         }
-        if self.compute.is_empty() { return progress.check_corpus_complete(); }
+        if self.compute.is_empty() {
+            progress.check_corpus_complete()?;
+            let pipelines = Pipelines::for_adapter(&progress.adapter)?;
+            return super::warm_library::publish(self, &pipelines.dev);
+        }
         let mut pipelines = Pipelines::for_adapter(&progress.adapter)?;
         let library_path = self.compute_directory().and_then(Path::parent).map(|dir| dir.join("compute.plib.pending"));
         if library_path.is_some() { super::pipeline_library::begin(&pipelines.dev)?; }
@@ -158,7 +174,7 @@ impl Corpus {
             let entries = super::pipeline_library::finish(path)?;
             eprintln!("pipeline library: {entries} compute entries");
         }
-        Ok(())
+        super::warm_library::publish(self, &pipelines.dev)
     }
 }
 
