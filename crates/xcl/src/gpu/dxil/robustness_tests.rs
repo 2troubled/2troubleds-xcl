@@ -154,6 +154,16 @@ fn split_wave64_real_lds_is_left_to_the_hlsl_path() {
 }
 
 #[test]
+fn split_wave64_spin_uses_fail_closed_direct_dxil() {
+    const V: u64 = 256;
+    let code = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let options = |split| KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+    kernel::translate_compute(&code, options(true), &cs).expect("counter-paired direct DXIL translation");
+    kernel::translate_compute(&code, options(false), &cs).expect("native wave64 translation");
+}
+
+#[test]
 fn real_lds_classification_excludes_cross_lane_ds_and_gds() {
     let one = |name, fields: &[(&str, u64)]| {
         let bytes = encode(name, "ENC_DS", fields, None).unwrap();
