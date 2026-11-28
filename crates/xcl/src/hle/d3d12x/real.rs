@@ -5235,7 +5235,13 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    let library_name = driver_cache::name_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
+    let library_name = match mode {
+        ComputeBuild::DirectChain => driver_cache::name_for_chain_root_node(
+            dxil, copy.Flags.0, driver_cache::ChainRoot::DirectConstants, samplers, copy.NodeMask),
+        ComputeBuild::IndirectChain => driver_cache::name_for_chain_root_node(
+            dxil, copy.Flags.0, driver_cache::ChainRoot::IndirectCbv, samplers, copy.NodeMask),
+        _ => driver_cache::name_for_root_node(dxil, copy.Flags.0, false, samplers, copy.NodeMask),
+    };
     if !ppv.is_null() {
         if let Some(pso) = crate::shaders::pipeline_library::load_compute(&library_name, &copy) {
             *ppv = pso.into_raw();
@@ -8178,7 +8184,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let library = crate::shaders::pipeline_library::store(
         match gkey {
-            Some((hash, bytes)) => driver_cache::graphics_name(hash, bytes),
+            Some((hash, bytes, _)) => driver_cache::graphics_name(hash, bytes),
             None if crate::shaders::pipeline_library::building() => {
                 super::pso_async::release(compute as usize);
                 return E_INVALIDARG;
@@ -8189,7 +8195,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     ).and_then(|_| {
         let compute_pso = ID3D12PipelineState::from_raw_borrowed(&compute)
             .ok_or_else(|| "The two-pass compute pipeline has no native object".to_string())?;
-        crate::shaders::pipeline_library::store(driver_cache::name(&tp.cs, 0), compute_pso)
+        crate::shaders::pipeline_library::store(
+            driver_cache::name_for_root_node(&tp.cs, 0, false, &tp.samplers, node_mask),
+            compute_pso,
+        )
     });
     if let Err(e) = library {
         note_translation_error(e);

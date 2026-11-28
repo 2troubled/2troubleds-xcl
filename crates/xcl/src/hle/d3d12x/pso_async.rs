@@ -5179,6 +5179,7 @@ mod used_tests {
             used: AtomicBool::new(false),
             late: AtomicBool::new(false),
             spared: AtomicBool::new(false),
+            on_use: Mutex::new(None),
         })
     }
 
@@ -7314,6 +7315,7 @@ mod used_tests {
         let pending = Pending {
             build: first_build.clone(), driver: AtomicUsize::new(0), compute: false, key: 0,
             used: AtomicBool::new(false), late: AtomicBool::new(false), spared: AtomicBool::new(false),
+            on_use: Mutex::new(None),
         };
         pending.note_use();
         assert!(!first_build.candidate_queued.load(Ordering::Acquire));
@@ -10586,6 +10588,7 @@ fn pipeline_resolution_for_kind_test(
         used: AtomicBool::new(false),
         late: AtomicBool::new(false),
         spared: AtomicBool::new(false),
+        on_use: Mutex::new(None),
     });
     PipelineResolution(
         StructuredResolve::initial(original, pending, original, true),
