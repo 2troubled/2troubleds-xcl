@@ -443,6 +443,13 @@ pub(super) struct SubmissionReceipt {
     value: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SubmissionReceiptStatus {
+    Pending,
+    Complete,
+    DeviceLost,
+}
+
 #[allow(dead_code)] // consumed by the later opt-in generation-pin stage
 impl SubmissionReceipt {
     /// Exact queue-marker generation. The retained `Arc` prevents pointer reuse while a
@@ -459,10 +466,28 @@ impl SubmissionReceipt {
         self.value
     }
 
-    /// Whether the GPU is past the native submission represented by this receipt.
+    /// Exact state of the native submission represented by this receipt. D3D12 fences return
+    /// `u64::MAX` after device removal; that sentinel is not successful completion.
+    pub(super) fn status(&self) -> SubmissionReceiptStatus {
+        match self.completed_value() {
+            u64::MAX => SubmissionReceiptStatus::DeviceLost,
+            completed if completed >= self.value => SubmissionReceiptStatus::Complete,
+            _ => SubmissionReceiptStatus::Pending,
+        }
+    }
+
+    /// Whether resources protected by this receipt may be retired. Device loss ends their GPU
+    /// use even though diagnostics must not report it as successful submission completion.
     pub(super) fn is_complete(&self) -> bool {
         self.completed_value() >= self.value
     }
+}
+
+/// Best-effort exact queue progress for diagnostics that own no submitted resources. The caller
+/// must already hold the queue's ordered turn. Failure leaves the sample untracked and does not
+/// poison a [`SubmissionGate`] or change later title submission behavior.
+pub(super) unsafe fn try_timing_receipt(queue: *mut c_void) -> Option<SubmissionReceipt> {
+    PendingSubmit { entries: Vec::new() }.finish_receipted(queue)
 }
 
 #[cfg(test)]
