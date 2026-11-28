@@ -13,6 +13,55 @@ struct Builder {
 
 static BUILD: std::sync::Mutex<Option<Builder>> = std::sync::Mutex::new(None);
 
+struct Active {
+    graphics: Option<NativeLibrary>,
+    compute: Option<NativeLibrary>,
+    names: [std::sync::Mutex<()>; 64],
+}
+
+static ACTIVE: std::sync::OnceLock<Active> = std::sync::OnceLock::new();
+
+pub(crate) fn activate(device: &ID3D12Device) {
+    let Some(ready) = super::warm_library::take_ready() else { return };
+    let open = |bytes| NativeLibrary::open_shared(device, bytes);
+    let graphics = match ready.graphics.map(open).transpose() {
+        Ok(library) => library,
+        Err(e) => {
+            crate::xlog_warn!("Pipeline library: runtime graphics activation failed ({e})");
+            return;
+        }
+    };
+    let compute = match ready.compute.map(open).transpose() {
+        Ok(library) => library,
+        Err(e) => {
+            crate::xlog_warn!("Pipeline library: runtime compute activation failed ({e})");
+            return;
+        }
+    };
+    if ACTIVE.set(Active { graphics, compute, names: std::array::from_fn(|_| std::sync::Mutex::new(())) }).is_ok() {
+        crate::xlog_info!("Pipeline library: activated prepared PSOs for lazy runtime loading");
+    }
+}
+
+fn with_name<T>(name: &str, f: impl FnOnce(&Active) -> Option<windows::core::Result<T>>) -> Option<T> {
+    let active = ACTIVE.get()?;
+    let slot = crate::gpu::shader::fnv64(name.as_bytes()) as usize % active.names.len();
+    let _same_name = active.names[slot].lock().unwrap();
+    f(active)?.ok()
+}
+
+pub(crate) fn load_compute(name: &str, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
+    with_name(name, |active| active.compute.as_ref().map(|library| library.load_compute(name, desc)))
+}
+
+pub(crate) fn load_graphics(name: &str, desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Option<ID3D12PipelineState> {
+    with_name(name, |active| active.graphics.as_ref().map(|library| library.load_graphics(name, desc)))
+}
+
+pub(crate) fn load_stream(name: &str, desc: &D3D12_PIPELINE_STATE_STREAM_DESC) -> Option<ID3D12PipelineState> {
+    with_name(name, |active| active.graphics.as_ref().map(|library| library.load_stream(name, desc)))
+}
+
 pub(crate) fn building() -> bool { BUILD.lock().unwrap().is_some() }
 
 pub(crate) fn begin(device: &ID3D12Device) -> std::result::Result<bool, String> {

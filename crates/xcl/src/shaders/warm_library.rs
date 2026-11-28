@@ -243,7 +243,9 @@ mod tests {
         super::super::prepare_for_launch(&root, &progress).unwrap();
         assert_eq!(progress.done.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(progress.total.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(take_ready().unwrap().compute.is_some());
+        super::super::pipeline_library::activate(&pipelines.dev);
+        assert!(super::super::pipeline_library::load_compute("fixture.pso", &desc).is_some());
+        assert!(super::super::pipeline_library::load_compute("missing.pso", &desc).is_none());
         let final_path = dir.join(COMPUTE);
         let valid = std::fs::read(&final_path).unwrap();
         std::fs::write(&final_path, b"corrupt").unwrap();
