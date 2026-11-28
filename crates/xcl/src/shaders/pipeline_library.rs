@@ -6,9 +6,78 @@
 use windows::core::{HSTRING, Interface, Result};
 use windows::Win32::Graphics::Direct3D12::*;
 
+struct Builder {
+    library: NativeLibrary,
+    names: std::collections::HashSet<String>,
+}
+
+static BUILD: std::sync::Mutex<Option<Builder>> = std::sync::Mutex::new(None);
+
+pub(crate) fn building() -> bool { BUILD.lock().unwrap().is_some() }
+
+pub(crate) fn begin(device: &ID3D12Device) -> std::result::Result<bool, String> {
+    if !NativeLibrary::supported(device) { return Ok(false) }
+    let library = NativeLibrary::empty(device).map_err(|e| format!("Creating pipeline library: {e}"))?;
+    let mut active = BUILD.lock().unwrap();
+    if active.is_some() { return Err("A pipeline library build is already active".into()); }
+    *active = Some(Builder { library, names: Default::default() });
+    Ok(true)
+}
+
+pub(crate) fn store(name: String, pipeline: &ID3D12PipelineState) -> std::result::Result<(), String> {
+    let mut active = BUILD.lock().unwrap();
+    let Some(builder) = active.as_mut() else { return Ok(()) };
+    if !builder.names.insert(name.clone()) { return Ok(()) }
+    if let Err(e) = builder.library.store(&name, pipeline) {
+        builder.names.remove(&name);
+        return Err(format!("Storing pipeline {name}: {e}"));
+    }
+    Ok(())
+}
+
+pub(crate) fn abort() { *BUILD.lock().unwrap() = None; }
+
+pub(crate) fn finish(path: &std::path::Path) -> std::result::Result<usize, String> {
+    let builder = BUILD.lock().unwrap().take().ok_or("No pipeline library build is active")?;
+    let count = builder.names.len();
+    let bytes = builder.library.serialize().map_err(|e| format!("Serializing pipeline library: {e}"))?;
+    write_atomic(path, &bytes).map_err(|e| format!("Publishing {}: {e}", path.display()))?;
+    Ok(count)
+}
+
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let (temporary, mut file) = loop {
+        let candidate = path.with_extension(format!("tmp{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        let from: Vec<u16> = temporary.as_os_str().encode_wide().chain([0]).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(temporary); }
+    result
+}
+
 pub(crate) struct NativeLibrary {
     library: ID3D12PipelineLibrary1,
-    _serialized: Vec<u8>,
+    _serialized: std::sync::Arc<[u8]>,
 }
 
 impl NativeLibrary {
@@ -26,10 +95,14 @@ impl NativeLibrary {
     }
 
     pub(crate) fn empty(device: &ID3D12Device) -> Result<Self> {
-        Self::open(device, Vec::new())
+        Self::open_shared(device, std::sync::Arc::from([]))
     }
 
     pub(crate) fn open(device: &ID3D12Device, serialized: Vec<u8>) -> Result<Self> {
+        Self::open_shared(device, serialized.into())
+    }
+
+    pub(crate) fn open_shared(device: &ID3D12Device, serialized: std::sync::Arc<[u8]>) -> Result<Self> {
         let device: ID3D12Device1 = device.cast()?;
         let library = if serialized.is_empty() {
             let mut library = std::ptr::null_mut();
@@ -86,7 +159,7 @@ impl NativeLibrary {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeLibrary;
+    use super::{abort, begin, finish, store, NativeLibrary};
     use crate::gpu::recomp;
     use crate::shaders::Pipelines;
     use std::mem::ManuallyDrop;
@@ -180,6 +253,34 @@ void main() { output.Store(0, 42); }
         let mut bytes = library.serialize().expect("serialize pipeline library");
         bytes.truncate(bytes.len() / 2);
         assert!(NativeLibrary::open(&pipelines.dev, bytes).is_err());
+        drop_desc(desc);
+    }
+
+    #[test]
+    fn builder_deduplicates_names_and_atomically_replaces_output() {
+        let Some((pipelines, dxil, root)) = fixture() else { return };
+        let desc = compute_desc(&dxil, &root);
+        let pso = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+            .expect("compute pipeline");
+        let path = std::env::temp_dir().join(format!("xcl-pipeline-library-{}.bin", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+        let _cleanup = Cleanup(path.clone());
+        abort();
+        assert!(begin(&pipelines.dev).expect("begin library"));
+        store("one".into(), &pso).expect("store one");
+        store("one".into(), &pso).expect("deduplicate one");
+        assert_eq!(finish(&path).expect("publish library"), 1);
+        let first = std::fs::read(&path).expect("published bytes");
+        NativeLibrary::open(&pipelines.dev, first).expect("published library");
+
+        assert!(begin(&pipelines.dev).expect("begin replacement"));
+        store("two".into(), &pso).expect("store replacement");
+        assert_eq!(finish(&path).expect("replace library"), 1);
+        let replacement = std::fs::read(&path).expect("replacement bytes");
+        let library = NativeLibrary::open(&pipelines.dev, replacement).expect("replacement library");
+        assert!(library.load_compute("one", &desc).is_err());
+        library.load_compute("two", &desc).expect("load replacement");
         drop_desc(desc);
     }
 

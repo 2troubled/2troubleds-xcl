@@ -14,9 +14,10 @@ use std::sync::Mutex;
 use crate::gpu::{dxbc, pack, rdna2, recomp, shader, xbox};
 use crate::hle::d3d12x::gfx_records;
 pub(crate) mod pso_corpus;
-mod pipeline_library;
+pub(crate) mod pipeline_library;
 mod warm_blobs;
 mod warm_pack;
+mod warm_library;
 pub(crate) mod warm_replay;
 
 pub(crate) fn warm_settings_key() -> u64 { warm_settings(std::env::vars_os()) }
@@ -32,7 +33,7 @@ fn warm_settings(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::O
             "XCL_HOST" | "XCL_DATA_ROOT" | "XCL_ADAPTER" | "XCL_DXIL_CACHE" | "XCL_UMA_MB" |
             "XCL_PRECOMPILE_PARENT" | "XCL_PREPARATION_PARENT" | "XCL_PREPARATION_MENU" |
             "XCL_PRECOMPILE_SLICE" | "XCL_PRECOMPILE_COVERAGE_MAP" | "XCL_PRECOMPILE_COVERAGE_DIR" |
-            "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PREPARE" |
+            "XCL_DXC_THREADS" | "XCL_PIPELINE_THREADS" | "XCL_PREPARE_WORKERS" | "XCL_PIPELINE_LIBRARY_OUT" | "XCL_PREPARE" |
             "XCL_PREPARE_GRAPHICS" | "XCL_PREPARE_ALL_LIVE" | "XCL_RUN_SECONDS" | "XCL_PRESS_AT" |
             "XCL_PRESS_AFTER_POLL" | "XCL_ACTIVITY" | "XCL_SKIP_BINK" | "XCL_FRAME_DUMP" |
             "XCL_FRAME_DUMP_FULL" | "XCL_GPU_CULPRIT" | "XCL_DSTORAGE_LATE_PAGE_MS" | "XCL_DISPATCH_TILE_AXIS") {
@@ -1700,7 +1701,7 @@ impl Pipelines {
         let mut cached = path.as_deref().and_then(driver_cache::load);
         let receipt = self.warm_blobs.as_ref().zip(layout).zip(path.as_deref());
         if let (Some(((book, layout), path)), Some(blob)) = (receipt, cached.as_ref()) {
-            if book.contains(&warm_blobs::stamp(path, layout, blob)) {
+            if !pipeline_library::building() && book.contains(&warm_blobs::stamp(path, layout, blob)) {
                 self.verified.fetch_add(1, Ordering::Relaxed);
                 drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
                 return Ok(());
@@ -1789,6 +1790,10 @@ impl Pipelines {
             }
             pso
         };
+        let library = match &r {
+            Ok(pso) => pipeline_library::store(driver_cache::name_for(dxil, desc.Flags.0, chained), pso),
+            Err(_) => Ok(()),
+        };
         drop(claim);
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
@@ -1800,7 +1805,8 @@ impl Pipelines {
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
-        r.map(drop).map_err(|e| format!("Creating native compute pipeline ({} bytes of DXIL): {e}", dxil.len()))
+        r.map(drop).map_err(|e| format!("Creating native compute pipeline ({} bytes of DXIL): {e}", dxil.len()))?;
+        library
     }
 }
 
@@ -1971,6 +1977,16 @@ fn loose_inputs(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 pub(crate) fn prepare_for_launch(root: &Path, progress: &LaunchPreparation) -> Result<(), String> {
     let corpus = pso_corpus::discover(root)?;
+    if let Some(corpus) = &corpus {
+        if warm_library::reuse(corpus, &progress.adapter) {
+            let (graphics, compute) = corpus.counts();
+            let total = graphics.checked_add(compute).ok_or("Pipeline corpus count overflow")?;
+            progress.begin_corpus(total);
+            progress.complete_corpus(total)?;
+            crate::xlog_info!("Pipeline preparation: reused the complete native pipeline libraries ({total} recipes)");
+            return Ok(());
+        }
+    }
     prepare_title_inputs(root, progress, corpus.as_ref())?;
     if let Some(corpus) = corpus {
         corpus.prepare(progress)?;
@@ -2509,8 +2525,15 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
     crate::gpu::uma::leave_out();
     recomp::pso::set_title_windows(windows);
     recomp::dxc::set_memory_reserve(2);
+    let library_path = std::env::var_os("XCL_PIPELINE_LIBRARY_OUT").map(PathBuf::from);
     let (device, book) = match Pipelines::for_adapter("auto") {
         Ok(p) => {
+            if library_path.is_some() {
+                match pipeline_library::begin(&p.dev) {
+                    Ok(_) => {}
+                    Err(e) => { eprintln!("xcl shaders: {e}"); return 2; }
+                }
+            }
             let cache = recomp::dxc::cache_dir();
             let book = warm_replay::native_key(&p.dev).and_then(|key| {
                 let known = warm_replay::driver_files(&cache.join("driver")).unwrap_or_default();
@@ -2543,7 +2566,7 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
                     }
                 })).unwrap_or(false);
                 let ok = if let Some(book) = &book {
-                    if book.can_defer(key) {
+                    if !pipeline_library::building() && book.can_defer(key) {
                         verified.fetch_add(1, Ordering::Relaxed);
                         true
                     } else {
@@ -2565,7 +2588,17 @@ fn graphics_worker(job: &Path, windows: u32, requested: Option<usize>) -> i32 {
     if let Some(book) = book { book.save(); }
     eprintln!("previously verified native graphics recipes: {}", verified.into_inner());
     let (hits, _, stored) = real::driver_cache_stats();
-    let failed = failed.into_inner();
+    let mut failed = failed.into_inner();
+    if failed == 0 {
+        if let Some(path) = library_path.as_deref().filter(|_| pipeline_library::building()) {
+            match pipeline_library::finish(path) {
+                Ok(n) => eprintln!("pipeline library: {n} graphics entries"),
+                Err(e) => { eprintln!("xcl shaders: {e}"); failed += 1; }
+            }
+        }
+    } else {
+        pipeline_library::abort();
+    }
     eprintln!("graphics pipelines: {} made, {failed} failed; driver blobs: {hits} from disk, {stored} kept", made.into_inner());
     if failed == 0 { 0 } else { 2 }
 }
