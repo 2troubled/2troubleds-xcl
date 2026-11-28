@@ -2435,7 +2435,7 @@ mod pipeline_selection_tests {
         PipelineJob {
             used,
             prewarm_indirect: false,
-            compiled: recomp::pso::Compiled { dispatch_chain: None, dxil: vec![0; bytes], samplers: Vec::new() },
+            compiled: recomp::pso::Compiled { dispatch_chain: None, dispatch_remap: None, dxil: vec![0; bytes], samplers: Vec::new() },
         }
     }
 
@@ -2706,30 +2706,30 @@ fn progress_count(line: &str) -> Option<usize> {
 /// A pipeline one process builds: a file beside the driver blob it will write (`<blob>.claim`),
 /// made when the build starts and gone when it ends. A second process that finds it leaves the
 /// pipeline to the first. One left behind by a process that died is taken over after `STALE`.
-struct Claim(PathBuf);
+struct WorkerClaim(PathBuf);
 
-impl Claim {
+impl WorkerClaim {
     const STALE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     /// None: another process has it.
-    fn take(blob: &std::path::Path) -> Option<Claim> {
+    fn take(blob: &std::path::Path) -> Option<WorkerClaim> {
         let mut name = blob.as_os_str().to_owned();
         name.push(".claim");
         let path = PathBuf::from(name);
         let make = || std::fs::OpenOptions::new().write(true).create_new(true).open(&path);
         match make() {
-            Ok(_) => Some(Claim(path)),
+            Ok(_) => Some(WorkerClaim(path)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let old = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Self::STALE);
-                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| Claim(path))
+                (old && std::fs::remove_file(&path).is_ok() && make().is_ok()).then(|| WorkerClaim(path))
             }
             // (the folder cannot be written: nothing is shared through it either)
-            Err(_) => Some(Claim(PathBuf::new())),
+            Err(_) => Some(WorkerClaim(PathBuf::new())),
         }
     }
 }
 
-impl Drop for Claim {
+impl Drop for WorkerClaim {
     fn drop(&mut self) {
         if !self.0.as_os_str().is_empty() {
             let _ = std::fs::remove_file(&self.0);
@@ -2739,7 +2739,7 @@ impl Drop for Claim {
 
 #[cfg(test)]
 mod claim_tests {
-    use super::Claim;
+    use super::WorkerClaim;
 
     /// The first process to ask builds a pipeline, a second one leaves it, and it is free again
     /// when the first is done.
@@ -2748,13 +2748,13 @@ mod claim_tests {
         let dir = std::env::temp_dir().join(format!("xcl-claim-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let blob = dir.join("0123.pso");
-        let first = Claim::take(&blob).expect("free");
+        let first = WorkerClaim::take(&blob).expect("free");
         assert!(dir.join("0123.pso.claim").exists());
-        assert!(Claim::take(&blob).is_none(), "claimed");
-        assert!(Claim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
+        assert!(WorkerClaim::take(&blob).is_none(), "claimed");
+        assert!(WorkerClaim::take(&dir.join("4567.pso")).is_some(), "another pipeline is free");
         drop(first);
         assert!(!dir.join("0123.pso.claim").exists());
-        assert!(Claim::take(&blob).is_some(), "free again");
+        assert!(WorkerClaim::take(&blob).is_some(), "free again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
