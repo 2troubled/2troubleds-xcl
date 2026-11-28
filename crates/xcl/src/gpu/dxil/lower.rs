@@ -200,7 +200,6 @@ pub enum Partner {
     /// several console waves per group: the halves pair up through arrival counters
     Spin,
     Missing,
-    Unsupported(&'static str),
 }
 
 #[derive(Default, Clone, Copy)]

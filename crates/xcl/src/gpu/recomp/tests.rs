@@ -7097,6 +7097,27 @@ fn split_wave64_meet_form_by_group_size() {
     let meet = &t.hlsl[t.hlsl.find("bool xcl_x_meet()").unwrap()..];
     let (leave, spin, barrier) = (meet.find("if (xcl_xn == 0u) return false;").unwrap(), meet.find("#if XCL_X_SPIN").unwrap(), meet.find("GroupMemoryBarrierWithGroupSync();").unwrap());
     assert!(leave < spin && spin < barrier);
+
+    // A multi-wave production entry checks both its initial EXEC exchange and an
+    // instruction exchange before any following instruction can consume the timeout value.
+    let cs = CsInterface { threads: [128, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let split = translate(&lane, &Options { mode: Mode::Compute(cs.clone()), wave64: true, split_wave64: true, no_remap: true, ..Default::default() }).unwrap();
+    assert!(split.hlsl.contains("static const uint XCL_X_FAIL = 0x80000000u;"));
+    assert!(split.hlsl.contains("((o | (o + lanes) | need) & XCL_X_FAIL) != 0u"));
+    assert!(split.hlsl.contains("InterlockedCompareExchange(XCL_XC(other), c, c | XCL_X_FAIL, actual);"));
+    assert!(split.hlsl.contains("xcl_x_dead = true; return false;"));
+    assert!(!split.hlsl.contains("abort();"));
+    assert!(split.hlsl.matches("if (xcl_x_dead) return;").count() >= 2, "{}", split.hlsl);
+
+    // An LDS instruction must not execute after its rendezvous reports a dead partner.
+    let lds = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None)]);
+    let split_lds = translate(&lds, &Options { mode: Mode::Compute(CsInterface { threads: [128, 1, 1], ..Default::default() }), wave64: true, split_wave64: true, no_remap: true, ..Default::default() }).unwrap();
+    let meet = split_lds.hlsl.rfind("xcl_x_meet();").expect("LDS rendezvous");
+    let guard = split_lds.hlsl[meet..].find("if (xcl_x_dead) return;").map(|at| meet + at).expect("post-rendezvous guard");
+    let access = split_lds.hlsl[meet..].find("xcl_lds[").map(|at| meet + at).expect("LDS write");
+    assert!(meet < guard && guard < access, "{}", split_lds.hlsl);
+    let native = translate(&lane, &Options { mode: Mode::Compute(cs), wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+    assert!(!native.hlsl.contains("xcl_x_dead"));
 }
 
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form
