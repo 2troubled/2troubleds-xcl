@@ -272,7 +272,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   rebuilds. Changes to translation, pipeline layout, settings or cache files trigger validation.
 - To prepare known graphics, two-pass mesh and compute recipes offline, use a local
   [archive layout profile](scripts/pso_corpus/archive-profile.md) with the following commands.
-  The staging command accepts several journals and deduplicates their recipes.
+  The staging command accepts several journals, deduplicates their recipes and atomically publishes
+  a content identity for later preparation receipts.
 
   ```powershell
   python scripts/pso_corpus/pso_archive.py profile.json archive.bin pipelines.bin

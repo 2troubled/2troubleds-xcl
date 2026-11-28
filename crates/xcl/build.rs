@@ -60,7 +60,7 @@ const PREPARATION_LAYOUT_SOURCES: &[&str] = &[
     "src/hle/d3d12x/gfx_records.rs",  // normalized recipe fields and reconstruction
 ];
 
-fn preparation_source_id(root: &Path) -> u64 {
+fn preparation_layout_id(root: &Path) -> u64 {
     let mut id = 0xcbf2_9ce4_8422_2325u64;
     add(&mut id, NATIVE_PREPARATION_ABI);
     for &relative in PREPARATION_LAYOUT_SOURCES {
@@ -70,6 +70,10 @@ fn preparation_source_id(root: &Path) -> u64 {
         add_source(&mut id, &std::fs::read(root.join(relative)).expect("read pipeline layout input"));
         add(&mut id, &[0]);
     }
+    id
+}
+
+fn preparation_source_id(mut id: u64) -> u64 {
     for name in ["TARGET", "PROFILE", "CARGO_ENCODED_RUSTFLAGS", "OPT_LEVEL", "DEBUG"] {
         add(&mut id, name.as_bytes());
         add(&mut id, std::env::var(name).unwrap_or_default().as_bytes());
@@ -94,7 +98,9 @@ fn main() {
         _ => {}
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    println!("cargo:rustc-env=XCL_NATIVE_PREPARATION_ID={:016x}", preparation_source_id(root));
+    let layout = preparation_layout_id(root);
+    println!("cargo:rustc-env=XCL_PIPELINE_LAYOUT_ID={layout:016x}");
+    println!("cargo:rustc-env=XCL_NATIVE_PREPARATION_ID={:016x}", preparation_source_id(layout));
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     add(&mut h, b"xcl-translator-source-v1\0");
     add(&mut h, TRANSLATION_GLUE_REVISION.as_bytes());

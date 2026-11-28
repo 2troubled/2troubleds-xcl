@@ -10,6 +10,24 @@ pub(crate) struct Corpus {
     graphics: Option<(PathBuf, usize)>,
     compute: Vec<(u64, PathBuf)>,
     windows: u32,
+    identity: Option<[u8; 32]>,
+}
+
+fn identity(path: &Path) -> Result<Option<[u8; 32]>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("Could not read pipeline corpus identity: {e}")),
+    };
+    let text = text.trim();
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Invalid pipeline corpus identity".into());
+    }
+    let mut out = [0; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2*i..2*i+2], 16).map_err(|_| "Invalid pipeline corpus identity")?;
+    }
+    Ok(Some(out))
 }
 
 pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
@@ -55,10 +73,13 @@ pub(crate) fn discover(root: &Path) -> Result<Option<Corpus>, String> {
         return Err("Pipeline corpus is missing records. Restage before launching.".into());
     }
     if graphics.is_none() && compute.is_empty() { return Err("Published pipeline corpus is empty".into()); }
-    Ok(Some(Corpus { graphics, compute, windows }))
+    let identity = identity(&dir.join("identity"))?;
+    Ok(Some(Corpus { graphics, compute, windows, identity }))
 }
 
 impl Corpus {
+    pub(crate) fn identity(&self) -> Option<[u8; 32]> { self.identity }
+
     pub(super) fn graphics_path(&self) -> Option<&Path> {
         self.graphics.as_ref().map(|(path, _)| path.as_path())
     }
@@ -206,6 +227,12 @@ mod tests {
         assert!(corpus.compute_path(17).is_none());
         assert!(corpus.graphics_path().is_none());
         assert_eq!(corpus.windows, 1);
+        assert_eq!(corpus.identity(), None);
+        std::fs::write(dir.join("identity"), "00".repeat(32)).unwrap();
+        assert_eq!(discover(&root).unwrap().unwrap().identity(), Some([0; 32]));
+        std::fs::write(dir.join("identity"), "truncated").unwrap();
+        assert!(discover(&root).is_err());
+        std::fs::remove_file(dir.join("identity")).unwrap();
         std::fs::write(dir.join("windows"), "255").unwrap();
         assert!(discover(&root).is_err());
         std::fs::write(dir.join("windows"), "0").unwrap();
